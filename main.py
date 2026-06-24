@@ -1,3 +1,4 @@
+import json
 from fastapi import FastAPI, HTTPException
 from llm_service import ChatbotService, QueryRequest
 
@@ -24,4 +25,12 @@ def chat_endpoint(request: QueryRequest):
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
         
     answer = bot_service.answer_user_query(request.prompt)
-    return {"response": answer}
+    
+    # <-- 2. Update this block to parse the string safely -->
+    try:
+        # Convert the raw LLM JSON string into a native Python dict
+        parsed_answer = json.loads(answer)
+        return {"response": parsed_answer}
+    except json.JSONDecodeError:
+        # Fallback if the LLM occasionally returns regular text instead of JSON
+        return {"response": answer}
