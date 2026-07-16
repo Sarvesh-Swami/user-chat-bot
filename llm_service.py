@@ -1,11 +1,13 @@
 import os
-import sqlite3
 import pandas as pd
 import requests
 import json
 import re
+import psycopg2
+import psycopg2.extras
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,25 +30,61 @@ class ChatbotService:
             "Content-Type": "application/json"
         }
         
-        # 2. Setup In-Memory SQLite Database
-        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        # 2. Setup PostgreSQL Database Connection
+        self.database_url = os.getenv("DATABASE_URL")
+        if not self.database_url:
+            raise ValueError("DATABASE_URL environment variable is required")
         
-        # --- NEW: REGISTER CUSTOM NATIVE MATH FUNCTION ---
-        import math
-        def calculate_distance(lat1, lng1, lat2, lng2):
-            if None in (lat1, lng1, lat2, lng2):
-                return 99999999.0
-            try:
-                rad_lat1, rad_lng1, rad_lat2, rad_lng2 = map(math.radians, [float(lat1), float(lng1), float(lat2), float(lng2)])
-                return 6371000 * math.acos(
-                    math.cos(rad_lat1) * math.cos(rad_lat2) * math.cos(rad_lng2 - rad_lng1) +
-                    math.sin(rad_lat1) * math.sin(rad_lat2)
-                )
-            except Exception:
-                return 99999999.0
-
-        self.conn.create_function("CALCULATE_DISTANCE", 4, calculate_distance)
-        self._load_csv_data()
+        # Parse database URL for connection parameters
+        self.db_params = self._parse_database_url(self.database_url)
+        
+        # Initialize connection pool
+        self.conn = None
+        self._init_database_connection()
+        
+        # 3. Load and cache database schema at startup
+        self.schema_cache = {}
+        self.mock_today = None
+        self._load_database_schema()
+        
+    def _parse_database_url(self, database_url):
+        """Parse PostgreSQL database URL into connection parameters"""
+        try:
+            parsed = urlparse(database_url)
+            return {
+                'host': parsed.hostname,
+                'port': parsed.port or 5432,
+                'database': parsed.path[1:],  # Remove leading slash
+                'user': parsed.username,
+                'password': parsed.password,
+            }
+        except Exception as e:
+            raise ValueError(f"Invalid DATABASE_URL format: {e}")
+    
+    def _init_database_connection(self):
+        """Initialize PostgreSQL database connection"""
+        try:
+            self.conn = psycopg2.connect(**self.db_params)
+            self.conn.autocommit = False  # Enable transaction control
+            print(f"[DATABASE] Successfully connected to PostgreSQL: {self.db_params['host']}:{self.db_params['port']}/{self.db_params['database']}")
+        except Exception as e:
+            print(f"[DATABASE ERROR] Failed to connect to PostgreSQL: {e}")
+            raise ConnectionError(f"Cannot connect to database: {e}")
+    
+    def _ensure_connection(self):
+        """Ensure database connection is alive, reconnect if necessary"""
+        try:
+            if self.conn.closed:
+                print("[DATABASE] Connection closed, reconnecting...")
+                self._init_database_connection()
+            else:
+                # Test connection with a simple query
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+        except Exception as e:
+            print(f"[DATABASE] Connection test failed, reconnecting: {e}")
+            self._init_database_connection()
     
     def _call_bedrock_api(self, messages, temperature=0.0, response_format=None):
         """Helper method to make API calls to Bedrock"""
@@ -266,168 +304,124 @@ class ChatbotService:
         
         return True, "Valid"
     
-    def _fix_sqlite_window_function_issues(self, sql_query):
-        """Fix SQLite window function limitations by converting complex LAG queries to CTE-based approach"""
+    def _fix_postgresql_query_issues(self, sql_query):
+        """Optimize queries for PostgreSQL and handle database-specific syntax"""
         
         sql_upper = sql_query.upper()
         
-        # Check if this is a geofence entry/exit query with LAG function issues
+        # PostgreSQL has excellent window function support, so most LAG issues are resolved
+        print("[POSTGRESQL] Processing query for PostgreSQL optimization")
+        
+        # Handle spatial distance calculations
+        if 'CALCULATE_DISTANCE' in sql_upper:
+            print("[POSTGRESQL] Converting custom distance function to PostgreSQL spatial calculation")
+            # Replace custom SQLite function with PostgreSQL haversine formula
+            sql_query = re.sub(
+                r'CALCULATE_DISTANCE\s*\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\s*\)',
+                r'(6371000 * acos(greatest(-1, least(1, cos(radians(\1)) * cos(radians(\3)) * cos(radians(\4) - radians(\2)) + sin(radians(\1)) * sin(radians(\3))))))',
+                sql_query,
+                flags=re.IGNORECASE
+            )
+        
+        # Convert SQLite string concatenation to PostgreSQL CONCAT where needed
+        if '||' in sql_query and 'date' in sql_query.lower():
+            # Convert "date || ' ' || time" patterns to CONCAT for better readability
+            sql_query = re.sub(
+                r"([a-zA-Z_]+\.?)date\s*\|\|\s*'\s*'\s*\|\|\s*([a-zA-Z_]+\.?)([a-zA-Z_]+)",
+                r"(\1date || ' ' || \2\3)",  # Keep || syntax as it works in PostgreSQL
+                sql_query,
+                flags=re.IGNORECASE
+            )
+        
+        # Handle geofence entry/exit queries with PostgreSQL optimizations
         if ('LAG(' in sql_upper and 
             'GEOFENCE' in sql_upper and 
-            'CALCULATE_DISTANCE' in sql_upper and
             ('ENTRY' in sql_upper or 'EXIT' in sql_upper)):
             
-            print("[SQLITE FIX] Detected problematic geofence LAG query, converting to CTE approach")
+            print("[POSTGRESQL] Detected geofence LAG query - using PostgreSQL native capabilities")
             
-            # Check if geofence_lookup table exists
-            try:
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='geofence_lookup'")
-                if not cursor.fetchone():
-                    print("[SQLITE FIX] Warning: geofence_lookup table not found, cannot apply fix")
-                    return sql_query
-            except Exception as e:
-                print(f"[SQLITE FIX] Could not check for geofence_lookup table: {e}")
-                return sql_query
-            
-            # Extract vehicle ID if present
-            vid_match = re.search(r'vid\s*=\s*(\d+)', sql_query, re.IGNORECASE)
+            # Extract vehicle ID
+            vid_match = re.search(r'(?:vehicle_id|vid)\s*=\s*(\d+)', sql_query, re.IGNORECASE)
             vehicle_id = vid_match.group(1) if vid_match else None
             
             if vehicle_id:
-                # Generate SQLite-compatible geofence entry/exit query using CTEs
-                fixed_query = f"""
+                # Generate PostgreSQL-optimized geofence query
+                optimized_query = f"""
                 WITH vehicle_positions AS (
                     SELECT 
-                        fh.vid,
-                        fh.lat,
-                        fh.lng,
+                        COALESCE(fh.vehicle_id, fh.vid) as vehicle_id,
+                        fh.latitude as lat,
+                        fh.longitude as lng,
+                        fh.recorded_at as timestamp,
                         fh.date,
-                        fh.gpstime,
-                        fh.date || ' ' || fh.gpstime AS full_timestamp,
-                        gl.geofence_id,
                         gl.geofence_name,
-                        gl.lat as geofence_lat,
-                        gl.lng as geofence_lng,
+                        gl.geofence_id,
                         gl.radius_meters,
-                        CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) AS distance_to_geofence,
-                        CASE WHEN CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) <= gl.radius_meters 
-                             THEN 1 ELSE 0 END AS is_inside,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY fh.vid, gl.geofence_id 
-                            ORDER BY fh.date ASC, fh.gpstime ASC
-                        ) AS row_num
+                        -- PostgreSQL haversine distance calculation
+                        (6371000 * acos(greatest(-1, least(1, 
+                            cos(radians(fh.latitude)) * cos(radians(gl.latitude)) * 
+                            cos(radians(gl.longitude) - radians(fh.longitude)) + 
+                            sin(radians(fh.latitude)) * sin(radians(gl.latitude))
+                        )))) AS distance_meters,
+                        CASE 
+                            WHEN (6371000 * acos(greatest(-1, least(1, 
+                                cos(radians(fh.latitude)) * cos(radians(gl.latitude)) * 
+                                cos(radians(gl.longitude) - radians(fh.longitude)) + 
+                                sin(radians(fh.latitude)) * sin(radians(gl.latitude))
+                            )))) <= gl.radius_meters 
+                            THEN 1 ELSE 0 
+                        END AS is_inside
                     FROM fleet_history fh
                     CROSS JOIN geofence_lookup gl
-                    WHERE fh.vid = {vehicle_id}
+                    WHERE COALESCE(fh.vehicle_id, fh.vid) = {vehicle_id}
+                    ORDER BY fh.recorded_at ASC, fh.date ASC
                 ),
-                position_with_previous AS (
+                position_changes AS (
                     SELECT 
-                        vid,
-                        geofence_id,
-                        geofence_name,
-                        full_timestamp,
-                        is_inside,
-                        distance_to_geofence,
+                        *,
                         LAG(is_inside, 1, 0) OVER (
-                            PARTITION BY vid, geofence_id 
-                            ORDER BY date ASC, gpstime ASC
-                        ) AS prev_inside,
-                        date,
-                        gpstime
+                            PARTITION BY vehicle_id, geofence_id 
+                            ORDER BY timestamp ASC
+                        ) AS prev_inside
                     FROM vehicle_positions
                 ),
                 entry_exit_events AS (
                     SELECT 
-                        vid,
+                        vehicle_id,
                         geofence_name,
-                        full_timestamp AS event_timestamp,
+                        timestamp,
                         CASE 
                             WHEN prev_inside = 0 AND is_inside = 1 THEN 'ENTRY'
                             WHEN prev_inside = 1 AND is_inside = 0 THEN 'EXIT'
                             ELSE NULL
                         END AS event_type,
-                        ROUND(distance_to_geofence, 2) AS distance_meters,
-                        date,
-                        gpstime
-                    FROM position_with_previous
+                        ROUND(distance_meters::numeric, 2) AS distance_meters
+                    FROM position_changes
                     WHERE (prev_inside = 0 AND is_inside = 1) OR (prev_inside = 1 AND is_inside = 0)
                 )
                 SELECT 
-                    vid,
+                    vehicle_id,
                     geofence_name,
                     event_type,
-                    event_timestamp,
+                    timestamp::text AS event_timestamp,
                     distance_meters
                 FROM entry_exit_events
                 WHERE event_type IS NOT NULL
-                ORDER BY date ASC, gpstime ASC;
+                ORDER BY timestamp ASC;
                 """
                 
-                print("[SQLITE FIX] Successfully converted to CTE-based query")
-                
-                # Test the query syntax by preparing it (without executing)
-                try:
-                    cursor = self.conn.cursor()
-                    cursor.execute("EXPLAIN QUERY PLAN " + fixed_query.strip())
-                    print("[SQLITE FIX] CTE query syntax validated successfully")
-                    return fixed_query.strip()
-                except Exception as e:
-                    print(f"[SQLITE FIX] CTE query validation failed: {e}")
-                    print("[SQLITE FIX] Falling back to simplified geofence query")
-                    
-                    # Fallback to a simpler query that just gets positions and distances
-                    simple_fallback = f"""
-                    SELECT 
-                        fh.vid,
-                        fh.date,
-                        fh.gpstime,
-                        fh.date || ' ' || fh.gpstime AS timestamp,
-                        gl.geofence_name,
-                        ROUND(CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng), 2) AS distance_meters,
-                        gl.radius_meters,
-                        CASE 
-                            WHEN CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) <= gl.radius_meters 
-                            THEN 'INSIDE' 
-                            ELSE 'OUTSIDE' 
-                        END AS status
-                    FROM fleet_history fh 
-                    CROSS JOIN geofence_lookup gl 
-                    WHERE fh.vid = {vehicle_id}
-                    ORDER BY fh.date ASC, fh.gpstime ASC;
-                    """
-                    
-                    try:
-                        cursor.execute("EXPLAIN QUERY PLAN " + simple_fallback.strip())
-                        print("[SQLITE FIX] Simple fallback query validated successfully")
-                        return simple_fallback.strip()
-                    except Exception as fallback_error:
-                        print(f"[SQLITE FIX] Even simple fallback failed: {fallback_error}")
-                        return sql_query
-            else:
-                print("[SQLITE FIX] No vehicle ID found in query, cannot apply geofence fix")
-                return sql_query
+                print("[POSTGRESQL] Generated PostgreSQL-optimized geofence query")
+                return optimized_query.strip()
         
-        # Check for other complex LAG usage patterns that might fail
-        elif 'LAG(' in sql_upper and ('WHERE' in sql_upper and 'LAG(' in sql_query[sql_query.upper().find('WHERE'):]):
-            print("[SQLITE FIX] Detected LAG() in WHERE clause, attempting to restructure")
-            
-            # For other LAG issues, try to move LAG to a CTE
-            try:
-                # Simple pattern: if LAG is used in WHERE, try to restructure
-                # This is a basic fix - more complex cases might need specific handling
-                if 'ORDER BY' in sql_upper:
-                    # Extract the main SELECT part and convert to CTE structure
-                    select_part = re.search(r'SELECT\s+.*?FROM', sql_query, re.IGNORECASE | re.DOTALL)
-                    if select_part:
-                        print("[SQLITE FIX] Restructuring LAG query with CTE")
-                        # For now, return original query with a warning
-                        # This can be expanded for specific cases as they arise
-                        pass
-            except Exception as e:
-                print(f"[SQLITE FIX] Could not restructure LAG query: {e}")
+        # Convert SQLite-specific syntax to PostgreSQL equivalents
+        # Handle LIMIT with OFFSET for pagination
+        if 'LIMIT' in sql_upper and 'OFFSET' not in sql_upper:
+            # PostgreSQL supports both SQLite-style LIMIT and its own LIMIT/OFFSET
+            pass  # Keep as is, PostgreSQL handles SQLite LIMIT syntax
         
-        # Return original query if no fixes were applied
+        # Convert any remaining SQLite-specific functions
+        sql_query = re.sub(r'\bIFNULL\b', 'COALESCE', sql_query, flags=re.IGNORECASE)
+        
         return sql_query
     
     def _classify_query_type(self, user_question, sql_query):
@@ -576,27 +570,52 @@ Respond with exactly one word: GENERAL or SPECIFIC"""
         return match.group(1) if match else None
     
     def _get_last_known_data(self, vehicle_id):
-        """Get the most recent data for a specific vehicle"""
+        """Get the most recent data for a specific vehicle from PostgreSQL"""
         try:
-            fallback_sql = f"""
-            SELECT vid, speed, mode, date, gpstime, addr, drivername
-            FROM fleet_history 
-            WHERE vid = {vehicle_id} 
-            ORDER BY date DESC, gpstime DESC 
-            LIMIT 1
-            """
+            self._ensure_connection()
             
-            df_result = pd.read_sql_query(fallback_sql, self.conn)
+            # Try different possible column names and table structures
+            fallback_queries = [
+                f"""
+                SELECT COALESCE(vehicle_id, vid) as vehicle_id, speed, status as mode, 
+                       date, recorded_at as gpstime, address as addr, driver_name as drivername
+                FROM fleet_history 
+                WHERE COALESCE(vehicle_id, vid) = {vehicle_id} 
+                ORDER BY recorded_at DESC, date DESC 
+                LIMIT 1
+                """,
+                f"""
+                SELECT vid as vehicle_id, speed, mode, date, gpstime, addr, drivername
+                FROM fleet_history 
+                WHERE vid = {vehicle_id} 
+                ORDER BY date DESC, gpstime DESC 
+                LIMIT 1
+                """
+            ]
             
-            if len(df_result) > 0:
-                # Convert to dict and ensure JSON serializable types
-                record = df_result.iloc[0].to_dict()
-                for key, value in record.items():
-                    if hasattr(value, 'item'):  # numpy scalar
-                        record[key] = value.item()
-                return record
-            else:
-                return None
+            for query in fallback_queries:
+                try:
+                    cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                    cursor.execute(query)
+                    result = cursor.fetchone()
+                    cursor.close()
+                    
+                    if result:
+                        # Convert to dict and ensure JSON serializable types
+                        record = dict(result)
+                        for key, value in record.items():
+                            if hasattr(value, 'item'):  # numpy scalar
+                                record[key] = value.item()
+                            elif value is None:
+                                record[key] = None
+                            else:
+                                record[key] = str(value) if not isinstance(value, (int, float)) else value
+                        return record
+                except Exception as e:
+                    print(f"[FALLBACK QUERY ERROR] Query failed: {e}")
+                    continue
+            
+            return None
                 
         except Exception as e:
             print(f"[FALLBACK QUERY ERROR]: {e}")
@@ -648,7 +667,10 @@ Respond with exactly one word: GENERAL or SPECIFIC"""
             }, default=self._json_serializer)
     
     def _execute_with_smart_limits(self, sql_query, user_question):
-        """Execute SQL with intelligent row count management and auto-summarization"""
+        """Execute SQL with intelligent row count management and auto-summarization on PostgreSQL"""
+        
+        # Ensure database connection is alive
+        self._ensure_connection()
         
         # Classify query type to determine appropriate limits
         query_type = self._classify_query_type(user_question, sql_query)
@@ -664,12 +686,14 @@ Respond with exactly one word: GENERAL or SPECIFIC"""
             print(f"[SMART LIMITS] Detected SPECIFIC query - using standard limits")
         
         try:
-            # Step 1: Try to get row count first
-            count_sql = f"SELECT COUNT(*) as row_count FROM ({sql_query.rstrip(';')})"
+            # Step 1: Try to get row count first using PostgreSQL syntax
+            count_sql = f"SELECT COUNT(*) as row_count FROM ({sql_query.rstrip(';')}) AS count_subquery"
             
             try:
-                count_result = pd.read_sql_query(count_sql, self.conn)
-                total_rows = int(count_result['row_count'].iloc[0])  # Ensure it's a Python int
+                cursor = self.conn.cursor()
+                cursor.execute(count_sql)
+                total_rows = int(cursor.fetchone()[0])
+                cursor.close()
                 print(f"[SMART LIMITS] Query will return {total_rows} rows (Type: {query_type.upper()})")
             
             except Exception as count_error:
@@ -821,32 +845,53 @@ Respond with exactly one word: GENERAL or SPECIFIC"""
             # Status/Mode breakdown
             if "fleet_history" in sql_lower or "vehicles" in sql_lower:
                 summary_queries.extend([
-                    "SELECT mode, COUNT(*) as count FROM ({}) GROUP BY mode ORDER BY count DESC".format(clean_original_sql),
-                    "SELECT date, COUNT(*) as records FROM ({}) GROUP BY date ORDER BY date DESC LIMIT 7".format(clean_original_sql)
+                    f"SELECT COALESCE(mode, status) as mode, COUNT(*) as count FROM ({clean_original_sql}) AS subquery GROUP BY COALESCE(mode, status) ORDER BY count DESC",
+                    f"SELECT date, COUNT(*) as records FROM ({clean_original_sql}) AS subquery GROUP BY date ORDER BY date DESC LIMIT 7"
                 ])
                 
                 # Add location analysis if location fields present
-                if "lat" in sql_lower or "lng" in sql_lower:
+                if any(field in sql_lower for field in ['lat', 'lng', 'address', 'addr', 'location']):
                     summary_queries.append(
-                        "SELECT SUBSTR(addr, 1, 50) as location, COUNT(*) as count FROM ({}) GROUP BY SUBSTR(addr, 1, 50) ORDER BY count DESC LIMIT 10".format(clean_original_sql)
+                        f"SELECT SUBSTRING(COALESCE(address, addr, location, 'Unknown') FROM 1 FOR 50) as location, COUNT(*) as count FROM ({clean_original_sql}) AS subquery GROUP BY SUBSTRING(COALESCE(address, addr, location, 'Unknown') FROM 1 FOR 50) ORDER BY count DESC LIMIT 10"
                     )
                 
                 # Add speed analysis if available
                 if "speed" in sql_lower:
                     summary_queries.append(
-                        "SELECT ROUND(AVG(speed), 2) as avg_speed, MAX(speed) as max_speed, MIN(speed) as min_speed, COUNT(*) as records FROM ({}) WHERE speed > 0".format(clean_original_sql)
+                        f"SELECT ROUND(AVG(speed)::numeric, 2) as avg_speed, MAX(speed) as max_speed, MIN(speed) as min_speed, COUNT(*) as records FROM ({clean_original_sql}) AS subquery WHERE speed > 0"
                     )
             
             # Execute summary queries
             summary_data = {}
             for i, query in enumerate(summary_queries):
                 try:
-                    df_summary = pd.read_sql_query(query, self.conn)
-                    # Convert numpy types to Python types for JSON serialization using our helper method
-                    summary_dict = self._convert_dataframe_to_serializable_dict(df_summary)
+                    self._ensure_connection()
+                    cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+                    cursor.execute(query)
+                    results = cursor.fetchall()
+                    cursor.close()
+                    
+                    # Convert results to JSON serializable format
+                    summary_dict = []
+                    for row in results:
+                        record = dict(row)
+                        for key, value in record.items():
+                            if hasattr(value, 'item'):  # Handle numpy/decimal types
+                                record[key] = value.item()
+                            elif value is None:
+                                record[key] = None
+                            else:
+                                # Convert decimals and other types to appropriate Python types
+                                if isinstance(value, (int, float)):
+                                    record[key] = value
+                                else:
+                                    record[key] = str(value)
+                        summary_dict.append(record)
+                    
                     summary_data[f"summary_{i+1}"] = summary_dict
                 except Exception as e:
-                    print(f"[SUMMARY QUERY ERROR]: {e}")
+                    print(f"[SUMMARY QUERY ERROR]: Query failed - {e}")
+                    print(f"[SUMMARY QUERY ERROR]: Failed query - {query}")
                     continue
             
             # Format the summary response in structured data format
@@ -1046,93 +1091,243 @@ Respond with exactly one word: GENERAL or SPECIFIC"""
                 "note": "Use more specific queries for detailed vehicle information."
             }, default=self._json_serializer)
         
-    def _load_csv_data(self):
-        """Loads the historical fleet dataset and geofence lookups into the unified memory db"""
-        file_path = "db/merged_fleet_final_fuel_data(2).csv"
-        geofence_path = "db/fleet_geofence_lookup.csv"
-        table_name = "fleet_history"
-        geo_table_name = "geofence_lookup"
-        
-        # 1. Load Telemetry Streams
-        if os.path.exists(file_path):
-            df = pd.read_csv(file_path)
-            df.columns = df.columns.str.replace(' ', '_').str.lower()
-            df.to_sql(table_name, self.conn, if_exists="replace", index=False)
-            print(f"Loaded {file_path} into single unified table '{table_name}'")
+    def _load_database_schema(self):
+        """Load and cache database schema information from PostgreSQL"""
+        try:
+            self._ensure_connection()
             
-            cursor = self.conn.cursor()
-            try:
-                cursor.execute(f"SELECT MAX(date) FROM {table_name}")
-                row = cursor.fetchone()
-                if row and row[0]:
-                    self.mock_today = str(row[0])
-                else:
-                    self.mock_today = "2026-06-19"
-            except Exception as e:
-                print(f"Error fetching max date: {e}")
-                self.mock_today = "2026-06-19"
-                
-            print(f"[SYSTEM ARCHITECTURE] Virtual 'Today' initialized to: {self.mock_today}")
-        else:
-            print(f"CRITICAL ERROR: Data file not found at path {file_path}")
-
-        # 2. Load Static Geofence Reference Table
-        if os.path.exists(geofence_path):
-            geo_df = pd.read_csv(geofence_path)
-            geo_df.columns = geo_df.columns.str.replace(' ', '_').str.lower()
+            print("[SCHEMA] Loading database schema from PostgreSQL...")
             
-            # Static coordinate anchors mapping directly to geofence names
-            coord_mapping = {
-                'Golden Quadilateral (Warehouse Hub)': (26.4499, 80.3319),
-                'Kanyakumari Road (Manufacturing Plant)': (14.2500, 77.8500),
-                'Logistics Hub Base Alpha-12 (Client Dropoff Zone)': (28.5355, 77.3910),
-                'Kundli - Manesar - Palwal Expressway (Corporate Office)': (28.3500, 77.0200),
-                'Asian Highway 43 (Restricted Logistics Area)': (21.3000, 79.4000),
-                '181/3 (Warehouse Hub)': (28.7761, 77.4725)
+            # Get all tables and their columns
+            tables_info = self._get_tables_info()
+            
+            # Get relationships (foreign keys)
+            relationships = self._get_relationships()
+            
+            # Get current date context from actual data
+            self.mock_today = self._get_current_date_context()
+            
+            # Cache the schema information
+            self.schema_cache = {
+                'tables': tables_info,
+                'relationships': relationships,
+                'last_updated': self.mock_today
             }
             
-            geo_df['lat'] = geo_df['geofence_name'].map(lambda x: coord_mapping.get(x, (0.0, 0.0))[0])
-            geo_df['lng'] = geo_df['geofence_name'].map(lambda x: coord_mapping.get(x, (0.0, 0.0))[1])
+            print(f"[SCHEMA] Loaded {len(tables_info)} tables")
+            print(f"[SCHEMA] Current data date context: {self.mock_today}")
             
-            geo_df.to_sql(geo_table_name, self.conn, if_exists="replace", index=False)
-            print(f"Loaded {geofence_path} into lookup table '{geo_table_name}' with coordinates.")
+        except Exception as e:
+            print(f"[SCHEMA ERROR] Failed to load database schema: {e}")
+            # Set default schema to prevent crashes
+            self.schema_cache = {'tables': {}, 'relationships': [], 'last_updated': '2026-06-20'}
+            self.mock_today = '2026-06-20'
+    
+    def _get_tables_info(self):
+        """Get detailed table and column information from PostgreSQL information_schema"""
+        
+        schema_query = """
+        SELECT 
+            t.table_name,
+            t.table_type,
+            c.column_name,
+            c.data_type,
+            c.is_nullable,
+            c.column_default,
+            c.ordinal_position,
+            tc.constraint_type,
+            COALESCE(obj_description(pgc.oid), t.table_name) as table_comment
+        FROM information_schema.tables t
+        LEFT JOIN information_schema.columns c ON t.table_name = c.table_name
+        LEFT JOIN information_schema.table_constraints tc ON t.table_name = tc.table_name 
+            AND tc.constraint_type = 'PRIMARY KEY'
+        LEFT JOIN pg_class pgc ON pgc.relname = t.table_name
+        WHERE t.table_schema = 'public' 
+            AND t.table_type = 'BASE TABLE'
+            AND c.table_schema = 'public'
+        ORDER BY t.table_name, c.ordinal_position;
+        """
+        
+        cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute(schema_query)
+        results = cursor.fetchall()
+        cursor.close()
+        
+        # Group results by table
+        tables = {}
+        for row in results:
+            table_name = row['table_name']
+            if table_name not in tables:
+                tables[table_name] = {
+                    'columns': [],
+                    'table_type': row['table_type'],
+                    'description': self._get_table_description(table_name)
+                }
+            
+            # Add column information
+            tables[table_name]['columns'].append({
+                'name': row['column_name'],
+                'type': row['data_type'],
+                'nullable': row['is_nullable'] == 'YES',
+                'default': row['column_default'],
+                'position': row['ordinal_position'],
+                'description': self._get_column_description(table_name, row['column_name'])
+            })
+        
+        return tables
+    
+    def _get_relationships(self):
+        """Get foreign key relationships between tables"""
+        
+        fk_query = """
+        SELECT
+            tc.table_name,
+            kcu.column_name,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name,
+            tc.constraint_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage AS ccu
+            ON ccu.constraint_name = tc.constraint_name
+            AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+            AND tc.table_schema = 'public';
+        """
+        
+        cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor.execute(fk_query)
+        results = cursor.fetchall()
+        cursor.close()
+        
+        relationships = []
+        for row in results:
+            relationships.append({
+                'table': row['table_name'],
+                'column': row['column_name'],
+                'references_table': row['foreign_table_name'],
+                'references_column': row['foreign_column_name'],
+                'constraint_name': row['constraint_name']
+            })
+        
+        return relationships
+    
+    def _get_current_date_context(self):
+        """Get the current date context from the actual data"""
+        try:
+            # Try to find date columns and get the maximum date
+            date_queries = [
+                "SELECT MAX(date) as max_date FROM fleet_history WHERE date IS NOT NULL",
+                "SELECT MAX(created_at) as max_date FROM tracking_data WHERE created_at IS NOT NULL", 
+                "SELECT CURRENT_DATE as max_date"  # Fallback to current date
+            ]
+            
+            for query in date_queries:
+                try:
+                    cursor = self.conn.cursor()
+                    cursor.execute(query)
+                    result = cursor.fetchone()
+                    cursor.close()
+                    
+                    if result and result[0]:
+                        date_value = result[0]
+                        if isinstance(date_value, str):
+                            return date_value
+                        else:
+                            return date_value.strftime('%Y-%m-%d')
+                except Exception:
+                    continue
+            
+            # Final fallback
+            return '2026-06-20'
+            
+        except Exception as e:
+            print(f"[SCHEMA] Could not determine date context: {e}")
+            return '2026-06-20'
+    
+    def _get_table_description(self, table_name):
+        """Generate business-friendly description for tables"""
+        
+        # Mapping of table names to business descriptions
+        descriptions = {
+            'fleet_vehicles': 'Master vehicle registry containing basic vehicle information and assignments',
+            'tracking_data': 'Real-time GPS tracking and sensor data from vehicles',
+            'fleet_history': 'Historical tracking records with GPS coordinates, speed, and status information',
+            'geofence_lookup': 'Geographic boundary definitions for warehouses, depots, and restricted areas',
+            'drivers': 'Driver information and contact details',
+            'routes': 'Predefined route information and waypoints',
+            'maintenance': 'Vehicle maintenance records and schedules',
+            'fuel_data': 'Fuel consumption and refueling records',
+            'alerts': 'System alerts and notifications for fleet events'
+        }
+        
+        return descriptions.get(table_name, f"Database table: {table_name}")
+    
+    def _get_column_description(self, table_name, column_name):
+        """Generate business-friendly description for columns"""
+        
+        # Common column patterns
+        if column_name.endswith('_id'):
+            return f"Unique identifier for {column_name[:-3]} records"
+        elif column_name in ['lat', 'latitude']:
+            return "GPS latitude coordinate"
+        elif column_name in ['lng', 'longitude']:
+            return "GPS longitude coordinate"
+        elif column_name in ['speed']:
+            return "Vehicle speed in kilometers per hour"
+        elif column_name in ['date', 'created_at', 'updated_at']:
+            return "Date/time when record was created or updated"
+        elif column_name in ['mode', 'status']:
+            return "Current operational status (RUNNING, STOPPED, IDLE, etc.)"
+        elif 'driver' in column_name.lower():
+            return "Driver name or identifier"
+        elif 'vehicle' in column_name.lower():
+            return "Vehicle identifier or information"
+        elif 'addr' in column_name.lower() or 'address' in column_name.lower():
+            return "Physical address or location description"
+        elif 'phone' in column_name.lower():
+            return "Contact phone number"
+        elif 'fuel' in column_name.lower():
+            return "Fuel level or consumption data"
+        elif 'distance' in column_name.lower():
+            return "Distance measurement in kilometers"
         else:
-            print(f"WARNING: Geofence metadata file not found at path {geofence_path}")
+            return f"Field: {column_name}"
             
     def _get_db_schema_string(self) -> str:
-        """Generates a multi-table schema overview for the Text-to-SQL engine"""
-        schema_info = """
-### Available Database Tables & Structural Definitions:
-
-1. Table Name: fleet_history
-Description: Contains chronological point-in-time telemetry tracking messages streamed from active vehicles.
-Columns:
-  - vid (INTEGER): Unique vehicle asset identifier.
-  - drivername (TEXT): Assigned driver name.
-  - phonenumber (TEXT): Contact number.
-  - lat (REAL): Current latitude coordinate value.
-  - lng (REAL): Current longitude coordinate value.
-  - latlong (TEXT): Lat and Lng packed together as string ("lat,lng").
-  - addr (TEXT): Resolved street address position string.
-  - gpstime (TEXT): Tracking interval log timestamp format ("DD-MM-YYYY HH:MM").
-  - speed (REAL): Vehicle speed value.
-  - mode (TEXT): Operational vehicle status state (Samples: 'RUNNING', 'STOPPED', 'IDLE', 'NOT WORKING').
-  - date (TEXT): Standard date stamp index string format ('YYYY-MM-DD').
-  - distance_traveled (REAL): Interval distance delta covered during this log point frame in kilometers.
-  - odometer (REAL): Total cumulative machine lifetime counter mileage in kilometers.
-
-2. Table Name: geofence_lookup
-Description: Static reference map definitions detailing warehouse facilities, plants, and zone centers.
-Columns:
-  - geofence_id (INTEGER): Unique geofence layout key.
-  - geofence_name (TEXT): Human descriptive title.
-  - geo_fence (TEXT): Descriptive address layout string.
-  - radius_meters (INTEGER): Allowed proximity validation fence threshold radius parameter.
-  - zone_type (TEXT): Label categorization.
-  - lat (REAL): Center coordinate latitude point of the fence area.
-  - lng (REAL): Center coordinate longitude point of the fence area.
-"""
-        return schema_info
+        """Generate dynamic schema documentation from live PostgreSQL database"""
+        
+        if not self.schema_cache.get('tables'):
+            return "### Database Schema: Not Available\nPlease check database connection."
+        
+        schema_parts = ["### Available PostgreSQL Database Tables & Schema:\n"]
+        
+        for table_name, table_info in self.schema_cache['tables'].items():
+            schema_parts.append(f"\n{len(schema_parts)}. Table Name: {table_name}")
+            schema_parts.append(f"Description: {table_info['description']}")
+            schema_parts.append("Columns:")
+            
+            for column in table_info['columns']:
+                nullable_text = "nullable" if column['nullable'] else "not null"
+                default_text = f", default: {column['default']}" if column['default'] else ""
+                
+                schema_parts.append(f"  - {column['name']} ({column['type'].upper()}, {nullable_text}{default_text}): {column['description']}")
+        
+        # Add relationships section
+        if self.schema_cache.get('relationships'):
+            schema_parts.append("\n### Table Relationships (Foreign Keys):")
+            for rel in self.schema_cache['relationships']:
+                schema_parts.append(f"- {rel['table']}.{rel['column']} → {rel['references_table']}.{rel['references_column']}")
+        
+        # Add spatial function information  
+        schema_parts.append("\n### Available Spatial Functions:")
+        schema_parts.append("- ST_Distance(point1, point2): Calculate distance between two geographic points")
+        schema_parts.append("- ST_DWithin(geometry, geometry, distance): Check if geometries are within specified distance")
+        schema_parts.append("- For lat/lng calculations, use: ST_Distance(ST_Point(lng1, lat1), ST_Point(lng2, lat2))")
+        
+        return "\n".join(schema_parts)
 
 
     def answer_user_query(self, user_question: str) -> str:
@@ -1141,10 +1336,10 @@ Columns:
 
         schema_context = self._get_db_schema_string()
         
-        # 1. SQL Generation Prompt with Spatial Calculation Constraints
+        # 1. SQL Generation Prompt for PostgreSQL Database
         system_prompt_sql = f"""
-        You are an elite database engineer specializing in translating natural language into perfectly optimized SQLite queries.
-        You have access to two relational tables: `fleet_history` and `geofence_lookup`.
+        You are an elite database engineer specializing in translating natural language into perfectly optimized PostgreSQL queries.
+        You have access to a PostgreSQL database with multiple related tables for fleet management.
 
         ### Database Schema Context:
         {schema_context}
@@ -1157,52 +1352,53 @@ Columns:
         Do NOT use markdown code blocks or formatting. Return ONLY the raw SQL statement.
         
         Example of CORRECT response:
-        SELECT vid, mode, speed FROM fleet_history WHERE date = '2026-06-20' ORDER BY gpstime DESC LIMIT 10;
+        SELECT vehicle_id, status, speed FROM fleet_history WHERE date = '2026-06-20' ORDER BY recorded_at DESC LIMIT 10;
         
         Example of INCORRECT response:
-        Here's the SQL query to get the information:
+        Here's the PostgreSQL query to get the information:
         ```sql
-        SELECT vid, mode, speed FROM fleet_history WHERE date = '2026-06-20' ORDER BY gpstime DESC LIMIT 10;
+        SELECT vehicle_id, status, speed FROM fleet_history WHERE date = '2026-06-20' ORDER BY recorded_at DESC LIMIT 10;
         ```
 
-        ### Strict Core Instructions:
-        1. Query Composition: Generate a valid SQLite query pulling from the table structures specified above. Use table joins where applicable.
-        2. String Comparisons: Use the `LIKE` operator with case-insensitivity (`%target%`) when matching driver names, geofence titles, zone labels, or addresses.
+        ### PostgreSQL-Specific Instructions:
+        1. Query Composition: Generate valid PostgreSQL queries using the table structures specified above. Use proper JOINs where applicable.
+        2. String Comparisons: Use ILIKE operator for case-insensitive string matching (e.g., WHERE driver_name ILIKE '%john%').
         3. Handling Time/Current State: 
-           - If a user asks for the "current", "now", "latest", or "today's" position of a vehicle, limit search strings to our virtual date `'{self.mock_today}'` OR use `ORDER BY date DESC, gpstime DESC LIMIT 1`.
-           - If a user asks for a "trip", "history", "route", or "track logs", return the timeline ordered chronologically: `ORDER BY date ASC, gpstime ASC`.
-        4. Date Format Filtering & Relative Time Translation: 
-           - The `date` column uses 'YYYY-MM-DD' strings. Convert words like "today" directly into `'{self.mock_today}'` inside your queries. Avoid SQLite's native `DATE('now')`.
-        5. Mileage & Distance Calculations Logic:
-           - To find cumulative trip distance, execute `SUM(distance_traveled)`. 
-           - To analyze total odometer change, execute `(MAX(odometer) - MIN(odometer))`. NEVER execute `SUM(odometer)`.
-        6. Fleet-Wide Aggregation Guardrail:
-           - If a user asks a broad summary question ("see running or stopped vehicles", "show overall distances"), NEVER run a generic `SELECT *`. Construct aggregate queries using `COUNT()`, `SUM()`, or `GROUP BY` to compress the rows returned.
-        7. Handling Running/Stopped Time (Historical Summaries by Date):
-           - If asked for "running time" or "stopped time" durations, translate the phrase into a daily status row count evaluation block: select `date`, `mode`, `COUNT(*) AS intervals_logged`, and `SUM(distance_traveled)`. Group them using `GROUP BY date, mode ORDER BY date ASC`.
-        8. Geofence Proximity & Spatial Math Analytics (CRITICAL):
-           - To find the exact distance in meters between a vehicle log position and a geofence center, use our custom SQL function: **`CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng)`**.
-           - Proximity Rules:
-             * Inside a geofence: `CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) <= gl.radius_meters`
-             * Outside a geofence: `CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) > gl.radius_meters`
-           - Fleet-Wide Outside Counting Logic:
-             * If the user wants to count vehicles currently "outside all geofences" right now, filter for the virtual date `'{self.mock_today}'` and assert that no record exists in `geofence_lookup` where the distance is less than or equal to the radius limit.
-             * Example query layout:
-               SELECT COUNT(DISTINCT fh.vid) FROM fleet_history fh WHERE fh.date = '{self.mock_today}' AND NOT EXISTS (SELECT 1 FROM geofence_lookup gl WHERE CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) <= gl.radius_meters);
+           - If a user asks for "current", "now", "latest", or "today's" data, filter by date = '{self.mock_today}' OR use ORDER BY recorded_at DESC, date DESC LIMIT 1.
+           - If a user asks for "trip", "history", "route", or "track logs", return chronologically: ORDER BY recorded_at ASC, date ASC.
+        4. Date Format & Time Translation: 
+           - Use PostgreSQL date functions like CURRENT_DATE, NOW(), DATE_TRUNC() when appropriate.
+           - Convert words like "today" directly into '{self.mock_today}' inside your queries.
+        5. Distance & Spatial Calculations:
+           - For distance calculations, use: (6371000 * acos(greatest(-1, least(1, cos(radians(lat1)) * cos(radians(lat2)) * cos(radians(lng2) - radians(lng1)) + sin(radians(lat1)) * sin(radians(lat2))))))
+           - This returns distance in meters between two lat/lng points.
+        6. Fleet-Wide Aggregation Guidelines:
+           - For broad queries ("show running vehicles", "list stopped vehicles"), use COUNT(), SUM(), GROUP BY to summarize results.
+           - Avoid SELECT * for large result sets.
+        7. Window Functions & Analytics:
+           - PostgreSQL has excellent window function support. Use LAG(), LEAD(), ROW_NUMBER(), RANK() as needed.
+           - For running totals: SUM(column) OVER (ORDER BY date_column)
+           - For rankings: RANK() OVER (ORDER BY column DESC)
+        8. Geofence Operations:
+           - Use CROSS JOIN between fleet_history and geofence_lookup for proximity analysis.
+           - Inside geofence: WHERE distance <= radius_meters
+           - Outside geofence: WHERE distance > radius_meters
         9. Handling Entry and Exit Timings (State Transitions):
-            If a user explicitly asks for 'entry' or 'exit' timings into geofences, use a simplified approach compatible with SQLite:
-            * AVOID complex LAG() functions in WHERE clauses or CASE statements
-            * Use a straightforward chronological query to get vehicle positions near geofences
-            * Let the system post-process the results to detect entry/exit events
-            * Example simple approach:
-              SELECT fh.vid, fh.date, fh.gpstime, gl.geofence_name, 
-                     CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) as distance,
-                     CASE WHEN CALCULATE_DISTANCE(fh.lat, fh.lng, gl.lat, gl.lng) <= gl.radius_meters THEN 'INSIDE' ELSE 'OUTSIDE' END as status
-              FROM fleet_history fh CROSS JOIN geofence_lookup gl 
-              WHERE fh.vid = [vehicle_id] 
-              ORDER BY fh.date ASC, fh.gpstime ASC;
+            If a user explicitly asks for 'entry' or 'exit' timings into geofences, use PostgreSQL's robust window functions:
+            * Use LAG() OVER (PARTITION BY vehicle_id, geofence_id ORDER BY recorded_at) to compare previous positions
+            * Entry: previous position outside, current position inside
+            * Exit: previous position inside, current position outside
+            * PostgreSQL handles complex window functions much better than SQLite
 
-        REMEMBER: Return ONLY the SQL query, nothing else.
+        ### PostgreSQL Data Types & Functions:
+        - Use TIMESTAMP for date/time columns
+        - Use NUMERIC for precise decimal calculations
+        - Use TEXT for string fields
+        - String functions: CONCAT(), SUBSTRING(), LENGTH(), TRIM()
+        - Math functions: ROUND(), CEIL(), FLOOR(), ABS()
+        - Date functions: DATE_TRUNC(), EXTRACT(), AGE()
+
+        REMEMBER: Return ONLY the PostgreSQL query, nothing else.
         """
         
         try:
@@ -1226,8 +1422,8 @@ Columns:
             # Clean and validate the generated SQL
             cleaned_sql = self._clean_sql_formatting(generated_sql)
             
-            # Fix SQLite-specific window function issues
-            fixed_sql = self._fix_sqlite_window_function_issues(cleaned_sql)
+            # Fix PostgreSQL-specific query issues
+            fixed_sql = self._fix_postgresql_query_issues(cleaned_sql)
             
             # Validate the fixed SQL
             is_valid, validation_message = self._validate_sql_syntax(fixed_sql)
