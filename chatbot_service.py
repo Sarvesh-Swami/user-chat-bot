@@ -40,8 +40,9 @@ class ChatbotService:
         
         # 5. Initialize Session Manager for conversational memory
         self.session_manager = SessionManager()
-        self.session_manager = SessionManager(max_history_turns=5)
-        self.visualization_engine = VisualizationEngine(llm_client=self.llm_client)
+        
+        # 6. Initialize Visualization Engine for chart generation
+        self.visualization_engine = VisualizationEngine(self.llm_client)
     
     def execute_pipeline(self, session_id: Optional[str], raw_user_prompt: str, temperature: float = 0.7) -> str:
         """Main pipeline with conversational memory support"""
@@ -52,6 +53,45 @@ class ChatbotService:
         # 2. Fetch history context for this session
         chat_history_str = self.session_manager.format_history_for_llm(session_id)
         history = self.session_manager.get_history(session_id)
+        
+        # 2.5. Check for chart/graph requests BEFORE query condensation
+        chart_keywords = ["graph", "chart", "plot", "visualize", "visual", "bar chart", "line chart", "show chart"]
+        is_chart_request = any(keyword in raw_user_prompt.lower() for keyword in chart_keywords)
+        
+        if is_chart_request and history:
+            # User wants a graph of what we just discussed! Retrieve the PREVIOUS database result.
+            print(f"[CHART DETECTION] Chart request detected for session {session_id}. Generating visualization.")
+            
+            # Get the last stored raw data from the session
+            previous_data = self.session_manager.get_last_raw_data(session_id)
+            
+            if previous_data:
+                # Generate the chart HTML using the visualization engine
+                chart_response = self.visualization_engine.generate_chart_html(previous_data, raw_user_prompt)
+                
+                # Commit this chart generation turn to history
+                self.session_manager.add_turn(
+                    session_id=session_id,
+                    user_prompt=raw_user_prompt,
+                    assistant_summary="Generated a visual chart/graph from the previous query data."
+                )
+                
+                # Return the chart response as JSON
+                return json.dumps(chart_response)
+            else:
+                # No previous data available for charting
+                no_data_response = {
+                    "type": "text",
+                    "display_value": "I don't have any recent data to create a chart from. Please run a data query first, then ask me to visualize it."
+                }
+                
+                self.session_manager.add_turn(
+                    session_id=session_id,
+                    user_prompt=raw_user_prompt,
+                    assistant_summary="No previous data available for chart generation."
+                )
+                
+                return json.dumps(no_data_response)
         
         # 3. Condense query if active context history exists
         if history:
@@ -70,6 +110,43 @@ class ChatbotService:
         
         # 4. Pass ONLY the resolved_query into the original Text-to-SQL execution flow
         api_response_payload = self._run_text_to_sql_pipeline(resolved_query, temperature)
+        
+        # 4.5. Store raw data for potential chart generation
+        try:
+            # Parse the API response to extract raw data
+            if isinstance(api_response_payload, str):
+                response_data = json.loads(api_response_payload)
+            else:
+                response_data = api_response_payload
+                
+            # Try multiple locations for raw data in the response structure
+            raw_data = None
+            
+            # First, check metadata for raw_data (if LLM synthesis was used)
+            if "metadata" in response_data:
+                # Check for trip_history, history_by_date, or other data arrays
+                metadata = response_data["metadata"]
+                raw_data = (metadata.get("trip_history") or 
+                           metadata.get("history_by_date") or 
+                           metadata.get("raw_data"))
+            
+            # If not found in metadata, check for direct data field (if raw data was returned)
+            if not raw_data and "data" in response_data:
+                raw_data = response_data["data"]
+                
+            # Store the data if it's a valid list with records
+            if raw_data and isinstance(raw_data, list) and len(raw_data) > 0:
+                # Ensure the records have useful data for charting
+                if isinstance(raw_data[0], dict) and len(raw_data[0]) > 1:
+                    self.session_manager.set_last_raw_data(session_id, raw_data)
+                    print(f"[DATA STORAGE] Stored {len(raw_data)} records for potential chart generation")
+                else:
+                    print(f"[DATA STORAGE] Skipped storing data - insufficient structure for charting")
+            else:
+                print(f"[DATA STORAGE] No chartable data found in response")
+                
+        except Exception as e:
+            print(f"[DATA STORAGE WARNING] Could not store raw data for charting: {e}")
         
         # 5. Extract a lean textual summary from the query processor execution results
         execution_summary = self._extract_execution_summary(api_response_payload, resolved_query)
@@ -411,6 +488,17 @@ class ChatbotService:
             )
             
             response_content = final_resp.choices[0].message.content.strip()
+            
+            # Inject raw records for potential charting if present
+            if "raw_records" in processed_result and processed_result["raw_records"]:
+                try:
+                    response_json = json.loads(response_content)
+                    if "metadata" not in response_json:
+                        response_json["metadata"] = {}
+                    response_json["metadata"]["raw_data"] = processed_result["raw_records"]
+                    response_content = json.dumps(response_json, default=self.db_manager._json_serializer)
+                except Exception as inject_err:
+                    print(f"[RAW RECORDS INJECTION ERROR]: {inject_err}")
             
             # Add information about limited results if applicable
             if processed_result.get("is_limited", False):

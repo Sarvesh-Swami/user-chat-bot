@@ -18,12 +18,13 @@ class SessionManager:
             self.sessions[session_id]["last_activity"] = datetime.now()
             return session_id
         
-        # Create new session
-        new_session_id = str(uuid.uuid4())
+        # Create new session using the provided session_id if available, otherwise generate UUID
+        new_session_id = session_id if session_id else str(uuid.uuid4())
         self.sessions[new_session_id] = {
             "created": datetime.now(),
             "last_activity": datetime.now(),
-            "messages": []
+            "messages": [],
+            "last_raw_data": None  # Store the last query result data for chart generation
         }
         return new_session_id
     
@@ -107,3 +108,15 @@ Standalone question:"""
         """Get number of active sessions"""
         self._cleanup_expired_sessions()
         return len(self.sessions)
+    
+    def set_last_raw_data(self, session_id: str, raw_data: List[Dict]):
+        """Store the last query result data for potential chart generation"""
+        if session_id in self.sessions:
+            self.sessions[session_id]["last_raw_data"] = raw_data
+            self.sessions[session_id]["last_activity"] = datetime.now()
+    
+    def get_last_raw_data(self, session_id: str) -> List[Dict]:
+        """Get the last stored raw data for chart generation"""
+        if session_id in self.sessions:
+            return self.sessions[session_id].get("last_raw_data", [])
+        return []

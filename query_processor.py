@@ -28,6 +28,12 @@ class QueryProcessor:
                         serializable_record[key] = None
                     elif isinstance(value, (pd.Int64Dtype, pd.Float64Dtype)):
                         serializable_record[key] = int(value) if pd.notna(value) else None
+                    elif hasattr(value, 'isoformat'):  # datetimes, dates, timestamps
+                        serializable_record[key] = value.isoformat()
+                    elif isinstance(value, bytes):
+                        serializable_record[key] = value.decode('utf-8')
+                    elif type(value).__name__ == 'Decimal':  # decimal.Decimal
+                        serializable_record[key] = float(value)
                     else:
                         serializable_record[key] = value
                 
@@ -200,9 +206,20 @@ class QueryProcessor:
                 if self._should_synthesize_with_llm(sql_query, user_question):
                     # For trip summaries, get aggregated stats and pass to LLM for synthesis
                     trip_stats = self._get_trip_summary_stats(sql_query)
+                    
+                    # Fetch raw records (up to 100) for subsequent charting requests
+                    try:
+                        raw_sql = f"{sql_query.rstrip(';')} LIMIT 100;"
+                        df_raw = pd.read_sql_query(raw_sql, self.db_manager.conn)
+                        raw_records = self._convert_dataframe_to_serializable_dict(df_raw)
+                    except Exception as raw_err:
+                        print(f"[RAW RECORDS FETCH ERROR]: {raw_err}")
+                        raw_records = None
+                        
                     return {
                         "is_summary": False,
                         "data": trip_stats,
+                        "raw_records": raw_records,
                         "total_rows": int(total_rows),
                         "query_type": query_type,
                         "is_trip_summary": True

@@ -24,6 +24,7 @@ def chat_interface():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>🚛 Fleet Management Assistant</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             * {
                 margin: 0;
