@@ -1,0 +1,109 @@
+import uuid
+import time
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+
+class SessionManager:
+    """Manages conversation sessions and context for the chatbot"""
+    
+    def __init__(self, session_timeout_minutes: int = 30, max_history_turns: int = 10):
+        self.sessions: Dict[str, Dict] = {}
+        self.session_timeout_minutes = session_timeout_minutes
+        self.max_history_turns = max_history_turns
+    
+    def get_or_create_session(self, session_id: Optional[str] = None) -> str:
+        """Get existing session or create new one"""
+        if session_id and session_id in self.sessions:
+            # Update last activity
+            self.sessions[session_id]["last_activity"] = datetime.now()
+            return session_id
+        
+        # Create new session
+        new_session_id = str(uuid.uuid4())
+        self.sessions[new_session_id] = {
+            "created": datetime.now(),
+            "last_activity": datetime.now(),
+            "messages": []
+        }
+        return new_session_id
+    
+    def get_history(self, session_id: str) -> List[Dict]:
+        """Get conversation history for a session"""
+        if session_id not in self.sessions:
+            return []
+        
+        self._cleanup_expired_sessions()
+        return self.sessions[session_id]["messages"]
+    
+    def format_history_for_llm(self, session_id: str) -> str:
+        """Format conversation history for LLM prompt"""
+        history = self.get_history(session_id)
+        if not history:
+            return ""
+        
+        formatted_lines = []
+        for msg in history[-self.max_history_turns:]:  # Only recent turns
+            formatted_lines.append(f"User: {msg['user_prompt']}")
+            formatted_lines.append(f"Assistant: {msg['assistant_summary']}")
+        
+        return "\n".join(formatted_lines)
+    
+    def get_condensation_prompt(self, chat_history_str: str, current_query: str) -> str:
+        """Generate prompt for query condensation"""
+        return f"""Given the following conversation history, rewrite the current user question as a standalone question that contains all necessary context for a fleet management database query.
+
+Previous conversation:
+{chat_history_str}
+
+Current user question: {current_query}
+
+Rewrite the current question to be completely standalone, replacing any references like "it", "that vehicle", "them", etc. with the specific entities mentioned in the conversation history. 
+
+Rules:
+- If the user refers to "it" or "that vehicle", use the specific vehicle ID from the conversation
+- If the user says "them" or "those vehicles", be specific about which vehicles
+- Keep the same intent but make it completely self-contained
+- Return ONLY the rewritten standalone question, no explanation
+
+Standalone question:"""
+    
+    def add_turn(self, session_id: str, user_prompt: str, assistant_summary: str):
+        """Add a conversation turn to the session"""
+        if session_id not in self.sessions:
+            self.get_or_create_session(session_id)
+        
+        turn = {
+            "user_prompt": user_prompt,
+            "assistant_summary": assistant_summary,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        self.sessions[session_id]["messages"].append(turn)
+        self.sessions[session_id]["last_activity"] = datetime.now()
+        
+        # Limit history size
+        if len(self.sessions[session_id]["messages"]) > self.max_history_turns * 2:
+            # Keep only recent turns
+            self.sessions[session_id]["messages"] = self.sessions[session_id]["messages"][-self.max_history_turns:]
+    
+    def clear_session(self, session_id: str):
+        """Clear a specific session"""
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+    
+    def _cleanup_expired_sessions(self):
+        """Remove expired sessions"""
+        current_time = datetime.now()
+        expired_sessions = []
+        
+        for session_id, session_data in self.sessions.items():
+            if current_time - session_data["last_activity"] > timedelta(minutes=self.session_timeout_minutes):
+                expired_sessions.append(session_id)
+        
+        for session_id in expired_sessions:
+            del self.sessions[session_id]
+    
+    def get_session_count(self) -> int:
+        """Get number of active sessions"""
+        self._cleanup_expired_sessions()
+        return len(self.sessions)
