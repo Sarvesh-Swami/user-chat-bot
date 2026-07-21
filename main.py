@@ -1,4 +1,5 @@
 import json
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,6 +10,11 @@ from typing import List
 
 # Initialize the FastAPI app
 app = FastAPI(title="Fleet Management Chatbot API", version="1.0.0")
+
+# Ensure the reports directory exists and mount it for static file serving
+REPORTS_DIR = os.path.join(os.path.dirname(__file__), "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
+app.mount("/reports", StaticFiles(directory=REPORTS_DIR), name="reports")
 
 # Initialize the chatbot service and query history manager
 bot_service = ChatbotService()
@@ -302,9 +308,31 @@ def chat_interface():
                         let botResponse = 'No response received';
                         let isRichMedia = false;
                         let htmlSnippet = '';
+                        let isPdfReport = false;
+                        let pdfUrl = '';
+                        let pdfLabel = '';
+                        let isEmailSent = false;
+                        let emailRecipient = '';
+                        let emailSubject = '';
+                        let emailMode = '';
+                        let emailFilename = '';
                         
+                        // Check if the response payload contains a PDF report
+                        if (data.response && data.response.type === 'pdf_report') {
+                            isPdfReport = true;
+                            botResponse = data.response.display_value || 'PDF report ready.';
+                            pdfUrl   = data.response.url || '';
+                            pdfLabel = data.response.filename || 'report.pdf';
+                        // Check if the response payload contains an email sent confirmation
+                        } else if (data.response && data.response.type === 'email_sent') {
+                            isEmailSent = true;
+                            botResponse = data.response.display_value || 'Email dispatched successfully.';
+                            emailRecipient = data.response.recipient || '';
+                            emailSubject = data.response.subject || '';
+                            emailMode = data.response.mode || '';
+                            emailFilename = data.response.filename || '';
                         // Check if the response payload contains a visual media graph configuration
-                        if (data.response && data.response.type === 'rich_media') {
+                        } else if (data.response && data.response.type === 'rich_media') {
                             botResponse = data.response.display_value;
                             htmlSnippet = data.response.html_content;
                             isRichMedia = true;
@@ -320,7 +348,13 @@ def chat_interface():
                         }
                         
                         // Send indicators to the rendering pipeline
-                        addMessage(botResponse, 'bot', isRichMedia, htmlSnippet);
+                        if (isPdfReport) {
+                            addPdfCard(botResponse, pdfUrl, pdfLabel);
+                        } else if (isEmailSent) {
+                            addEmailCard(botResponse, emailRecipient, emailSubject, emailMode, emailFilename);
+                        } else {
+                            addMessage(botResponse, 'bot', isRichMedia, htmlSnippet);
+                        }
                     } else {
                         addMessage(`❌ Error: ${response.status} ${response.statusText}`, 'bot');
                     }
@@ -373,6 +407,164 @@ def chat_interface():
                 chatMessages.appendChild(messageDiv);
                 
                 // Keep the chat frame scrolled down
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            function addPdfCard(summaryText, pdfUrl, filename) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message bot';
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+
+                // Summary text
+                const textNode = document.createElement('div');
+                textNode.textContent = summaryText;
+                textNode.style.marginBottom = '12px';
+                contentDiv.appendChild(textNode);
+
+                // PDF download card
+                const card = document.createElement('div');
+                card.style.cssText = `
+                    background: linear-gradient(135deg, #f8f9ff 0%, #ede9fe 100%);
+                    border: 1px solid #c4b5fd;
+                    border-radius: 12px;
+                    padding: 16px;
+                    display: flex;
+                    align-items: center;
+                    gap: 14px;
+                    margin-top: 4px;
+                `;
+
+                // PDF icon
+                const icon = document.createElement('div');
+                icon.style.cssText = `
+                    width: 44px; height: 44px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    border-radius: 10px;
+                    display: flex; align-items: center; justify-content: center;
+                    font-size: 22px; flex-shrink: 0;
+                `;
+                icon.textContent = '📄';
+
+                // Info block
+                const info = document.createElement('div');
+                info.style.flex = '1';
+
+                const title = document.createElement('div');
+                title.style.cssText = 'font-weight: 600; font-size: 14px; color: #1e293b;';
+                title.textContent = 'Fleet Report Ready';
+
+                const sub = document.createElement('div');
+                sub.style.cssText = 'font-size: 11px; color: #64748b; margin-top: 2px;';
+                sub.textContent = filename;
+
+                info.appendChild(title);
+                info.appendChild(sub);
+
+                // Download button
+                const btn = document.createElement('a');
+                btn.href = pdfUrl;
+                btn.target = '_blank';
+                btn.download = filename;
+                btn.style.cssText = `
+                    padding: 8px 16px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    text-decoration: none;
+                    white-space: nowrap;
+                    transition: opacity 0.2s;
+                `;
+                btn.textContent = '⬇ Download PDF';
+                btn.onmouseover = () => btn.style.opacity = '0.85';
+                btn.onmouseout  = () => btn.style.opacity = '1';
+
+                card.appendChild(icon);
+                card.appendChild(info);
+                card.appendChild(btn);
+                contentDiv.appendChild(card);
+
+                messageDiv.appendChild(contentDiv);
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            function addEmailCard(summaryText, recipient, subject, mode, filename) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message bot';
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+
+                // Summary text
+                const textNode = document.createElement('div');
+                textNode.textContent = summaryText;
+                textNode.style.marginBottom = '12px';
+                contentDiv.appendChild(textNode);
+
+                // Email confirmation card
+                const card = document.createElement('div');
+                card.style.cssText = `
+                    background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+                    border: 1px solid #86efac;
+                    border-radius: 12px;
+                    padding: 16px;
+                    display: flex;
+                    align-items: center;
+                    gap: 14px;
+                    margin-top: 4px;
+                `;
+
+                // Envelope icon
+                const icon = document.createElement('div');
+                icon.style.cssText = `
+                    width: 44px; height: 44px;
+                    background: linear-gradient(135deg, #22c55e 0%, #15803d 100%);
+                    border-radius: 10px;
+                    display: flex; align-items: center; justify-content: center;
+                    font-size: 22px; flex-shrink: 0;
+                `;
+                icon.textContent = '✉️';
+
+                // Info block
+                const info = document.createElement('div');
+                info.style.flex = '1';
+
+                const title = document.createElement('div');
+                title.style.cssText = 'font-weight: 600; font-size: 14px; color: #14532d;';
+                title.textContent = 'Email Dispatched';
+
+                const sub = document.createElement('div');
+                sub.style.cssText = 'font-size: 11px; color: #166534; margin-top: 2px; line-height: 1.4;';
+                sub.innerHTML = `To: <b>${recipient}</b><br/>Subject: <i>${subject}</i><br/>Attachment: <code>${filename || 'None'}</code>`;
+
+                info.appendChild(title);
+                info.appendChild(sub);
+
+                // Status Badge
+                const badge = document.createElement('div');
+                badge.style.cssText = `
+                    padding: 6px 12px;
+                    background: ${mode === 'Mock Mode' ? '#fef3c7' : '#dcfce7'};
+                    color: ${mode === 'Mock Mode' ? '#d97706' : '#15803d'};
+                    border: 1px solid ${mode === 'Mock Mode' ? '#fcd34d' : '#86efac'};
+                    border-radius: 20px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    white-space: nowrap;
+                `;
+                badge.textContent = mode;
+
+                card.appendChild(icon);
+                card.appendChild(info);
+                card.appendChild(badge);
+                contentDiv.appendChild(card);
+
+                messageDiv.appendChild(contentDiv);
+                chatMessages.appendChild(messageDiv);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
             }
 

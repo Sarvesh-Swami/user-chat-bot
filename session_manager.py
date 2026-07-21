@@ -24,7 +24,8 @@ class SessionManager:
             "created": datetime.now(),
             "last_activity": datetime.now(),
             "messages": [],
-            "last_raw_data": None  # Store the last query result data for chart generation
+            "last_raw_data": None,  # Store the last query result data for chart generation
+            "last_pdf_report": None  # Store the last generated PDF report info
         }
         return new_session_id
     
@@ -120,3 +121,15 @@ Standalone question:"""
         if session_id in self.sessions:
             return self.sessions[session_id].get("last_raw_data", [])
         return []
+
+    def set_last_pdf_report(self, session_id: str, pdf_info: dict):
+        """Store the last generated PDF report info"""
+        if session_id in self.sessions:
+            self.sessions[session_id]["last_pdf_report"] = pdf_info
+            self.sessions[session_id]["last_activity"] = datetime.now()
+
+    def get_last_pdf_report(self, session_id: str) -> Optional[dict]:
+        """Get the last generated PDF report info"""
+        if session_id in self.sessions:
+            return self.sessions[session_id].get("last_pdf_report")
+        return None

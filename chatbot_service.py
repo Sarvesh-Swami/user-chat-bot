@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import datetime
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
@@ -10,6 +11,8 @@ from llm_client import LLMClient
 from query_processor import QueryProcessor
 from session_manager import SessionManager
 from visualization_engine import VisualizationEngine
+from pdf_report_service import PdfReportService
+from email_engine import EmailEngine
 
 # Load environment variables from .env file
 load_dotenv()
@@ -43,6 +46,12 @@ class ChatbotService:
         
         # 6. Initialize Visualization Engine for chart generation
         self.visualization_engine = VisualizationEngine(self.llm_client)
+        
+        # 7. Initialize PDF Report Service for report generation
+        self.pdf_report_service = PdfReportService()
+        
+        # 8. Initialize Email Engine for sending emails
+        self.email_engine = EmailEngine()
     
     def execute_pipeline(self, session_id: Optional[str], raw_user_prompt: str, temperature: float = 0.7) -> str:
         """Main pipeline with conversational memory support"""
@@ -54,7 +63,136 @@ class ChatbotService:
         chat_history_str = self.session_manager.format_history_for_llm(session_id)
         history = self.session_manager.get_history(session_id)
         
-        # 2.5. Check for chart/graph requests BEFORE query condensation
+        # 2.4. Check for Email report requests BEFORE PDF/chart/query condensation
+        email_pattern = r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
+        email_match = re.search(email_pattern, raw_user_prompt)
+        
+        if email_match and history:
+            recipient_email = email_match.group(0)
+            print(f"[EMAIL DETECTION] Email request detected for session {session_id} to {recipient_email}.")
+            
+            # Check if we have a PDF already generated, or raw data to generate one
+            pdf_info = self.session_manager.get_last_pdf_report(session_id)
+            previous_data = self.session_manager.get_last_raw_data(session_id)
+            
+            if not pdf_info and previous_data:
+                print(f"[EMAIL DETECTION] Generating PDF report from cached raw data...")
+                pdf_info = self.pdf_report_service.generate(
+                    data=previous_data,
+                    title="Fleet Management Report",
+                    user_question=raw_user_prompt,
+                )
+                if pdf_info and "error" not in pdf_info:
+                    self.session_manager.set_last_pdf_report(session_id, pdf_info)
+            
+            if pdf_info and "error" not in pdf_info:
+                # Send the email with the PDF attached
+                attachment_path = pdf_info["filepath"]
+                subject = "Fleet Management Report"
+                body = f"""Hello,
+
+Please find attached the Fleet Management Report you requested.
+
+Report Details:
+- Filename: {pdf_info['filename']}
+- Total Records: {pdf_info['record_count']:,}
+- Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Best regards,
+Fleet Management Assistant"""
+                
+                email_result = self.email_engine.send_email_with_attachment(
+                    recipient_email=recipient_email,
+                    subject=subject,
+                    body_content=body,
+                    attachment_path=attachment_path
+                )
+                
+                if email_result.get("success", False):
+                    email_response = {
+                        "type": "email_sent",
+                        "display_value": f"Report successfully emailed to {recipient_email}.",
+                        "recipient": recipient_email,
+                        "subject": subject,
+                        "mode": email_result.get("mode", "SMTP"),
+                        "filename": pdf_info["filename"]
+                    }
+                else:
+                    email_response = {
+                        "type": "text",
+                        "display_value": f"Failed to send email to {recipient_email}: {email_result.get('message', 'Unknown error')}"
+                    }
+                
+                self.session_manager.add_turn(
+                    session_id=session_id,
+                    user_prompt=raw_user_prompt,
+                    assistant_summary=f"Emailed report to {recipient_email}."
+                )
+                return json.dumps(email_response)
+            else:
+                no_data_response = {
+                    "type": "text",
+                    "display_value": "I don't have any recent data to email. Please query for some data first, then ask me to email the report."
+                }
+                self.session_manager.add_turn(
+                    session_id=session_id,
+                    user_prompt=raw_user_prompt,
+                    assistant_summary="No data available to email."
+                )
+                return json.dumps(no_data_response)
+
+        # 2.5. Check for PDF report requests BEFORE chart/query condensation
+        pdf_keywords = ["pdf", "report", "export", "download report", "generate report", "export report", "pdf report"]
+        is_pdf_request = any(keyword in raw_user_prompt.lower() for keyword in pdf_keywords)
+        
+        if is_pdf_request and history:
+            print(f"[PDF DETECTION] PDF report request detected for session {session_id}.")
+            previous_data = self.session_manager.get_last_raw_data(session_id)
+            
+            if previous_data:
+                # Generate PDF using the last stored raw data
+                result = self.pdf_report_service.generate(
+                    data=previous_data,
+                    title="Fleet Management Report",
+                    user_question=raw_user_prompt,
+                )
+                
+                if "error" in result:
+                    pdf_response = {
+                        "type": "text",
+                        "display_value": f"Sorry, I could not generate the PDF report: {result['error']}"
+                    }
+                else:
+                    pdf_response = {
+                        "type": "pdf_report",
+                        "display_value": f"Your PDF report is ready with {result['record_count']:,} records.",
+                        "filename":    result["filename"],
+                        "url":         result["url_path"],
+                        "record_count": result["record_count"],
+                    }
+                    print(f"[PDF DETECTION] PDF generated: {result['url_path']}")
+                    # Cache the generated PDF details in the session
+                    self.session_manager.set_last_pdf_report(session_id, result)
+                
+                self.session_manager.add_turn(
+                    session_id=session_id,
+                    user_prompt=raw_user_prompt,
+                    assistant_summary=f"Generated a PDF report with {result.get('record_count', 0)} records."
+                )
+                return json.dumps(pdf_response)
+            else:
+                no_data_response = {
+                    "type": "text",
+                    "display_value": "I don't have any recent data to generate a PDF report from. Please run a data query first, then ask me to export it."
+                }
+                self.session_manager.add_turn(
+                    session_id=session_id,
+                    user_prompt=raw_user_prompt,
+                    assistant_summary="No previous data available for PDF report generation."
+                )
+                return json.dumps(no_data_response)
+        
+        # 2.6. Check for chart/graph requests BEFORE query condensation
         chart_keywords = ["graph", "chart", "plot", "visualize", "visual", "bar chart", "line chart", "show chart"]
         is_chart_request = any(keyword in raw_user_prompt.lower() for keyword in chart_keywords)
         
