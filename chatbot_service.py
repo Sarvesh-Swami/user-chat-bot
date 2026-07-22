@@ -13,6 +13,8 @@ from session_manager import SessionManager
 from visualization_engine import VisualizationEngine
 from pdf_report_service import PdfReportService
 from email_engine import EmailEngine
+from intent_parser import IntentParser
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -52,6 +54,10 @@ class ChatbotService:
         
         # 8. Initialize Email Engine for sending emails
         self.email_engine = EmailEngine()
+        
+        # 9. Initialize Intent Parser for query validation
+        self.intent_parser = IntentParser(self.llm_client, self.schema_cache)
+
     
     def execute_pipeline(self, session_id: Optional[str], raw_user_prompt: str, temperature: float = 0.7) -> str:
         """Main pipeline with conversational memory support"""
@@ -62,6 +68,53 @@ class ChatbotService:
         # 2. Fetch history context for this session
         chat_history_str = self.session_manager.format_history_for_llm(session_id)
         history = self.session_manager.get_history(session_id)
+        
+        # 2.1. Check query supportability using Intent Parser
+        intent_result = self.intent_parser.parse(
+            raw_user_prompt=raw_user_prompt,
+            chat_history_str=chat_history_str
+        )
+        
+        if not intent_result.get("is_supported", True):
+            denial_msg = intent_result.get("denial_reason") or "I am sorry, but that query is not supported by our fleet management system."
+            print(f"[INTENT PARSER] Query denied: '{raw_user_prompt}'. Reason: {denial_msg}")
+            
+            denial_response = {
+                "type": "text",
+                "display_value": denial_msg
+            }
+            
+            # Commit this turn to the rolling context log as denied
+            self.session_manager.add_turn(
+                session_id=session_id,
+                user_prompt=raw_user_prompt,
+                assistant_summary=f"Query denied: {denial_msg}"
+            )
+            return json.dumps(denial_response)
+            
+        # If the intent is conversational, respond directly and bypass SQL/query building entirely
+        if intent_result.get("intent") == "conversational":
+            response_text = intent_result.get("response_text") or "Hello! I am your Fleet Management Assistant. How can I help you today?"
+            try:
+                print(f"[INTENT PARSER] Conversational reply: '{response_text}'")
+            except Exception:
+                try:
+                    print(f"[INTENT PARSER] Conversational reply (sanitized): '{response_text.encode('ascii', 'ignore').decode('ascii')}'")
+                except Exception:
+                    pass
+            
+            conv_response = {
+                "type": "text",
+                "display_value": response_text
+            }
+            
+            # Commit this turn to history
+            self.session_manager.add_turn(
+                session_id=session_id,
+                user_prompt=raw_user_prompt,
+                assistant_summary=response_text
+            )
+            return json.dumps(conv_response)
         
         # 2.4. Check for Email report requests BEFORE PDF/chart/query condensation
         email_pattern = r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
