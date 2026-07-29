@@ -31,6 +31,24 @@ class IntentParser:
                     "intent": "unsupported"
                 }
 
+        # Pre-check: Allow common affirmative words/typos and short responses without denying
+        prompt_clean = raw_user_prompt.strip().lower()
+        common_affirmatives = {
+            "yes", "yres", "yea", "yeah", "yup", "sure", "ok", "okay", 
+            "go ahead", "do it", "please", "yes please", "hi", "hello", 
+            "hey", "thanks", "thank you", "no", "nope"
+        }
+        if prompt_clean in common_affirmatives or re.match(r"^\s*(y+e+s+|y+r+e+s+|y+e+a+h*|y+u+p+|s+u+r+e+|o+k+a*y*)\s*$", prompt_clean):
+            print(f"[INTENT PARSER] Pre-check matched affirmative/conversational prompt: '{raw_user_prompt}'")
+            return {
+                "is_supported": True,
+                "denial_reason": None,
+                "intent": "conversational",
+                "response_text": "How can I assist you with your fleet today?",
+                "query_category": "default",
+                "confidence": 1.0
+            }
+
         # Build schema summary for the intent parser context
         schema_summary = self._get_capabilities_context()
 
@@ -65,10 +83,28 @@ You MUST respond with a single JSON object. Do not include markdown formatting o
 JSON Schema:
 {{
   "is_supported": boolean,
-  "denial_reason": string or null, // Provide a friendly, helpful, but firm explanation of why it was denied if is_supported is false. Suggest what is supported. Keep it null if is_supported is true.
+  "denial_reason": string or null,
   "intent": "text_to_sql" | "pdf_report" | "email_report" | "chart_generation" | "conversational" | "unsupported",
-  "response_text": string or null // Populate with a helpful, friendly, natural response only if intent is 'conversational'. Otherwise keep it null.
-}}"""
+  "response_text": string or null,
+  "query_category": "vehicle_location" | "vehicle_livetrack" | "trip_current" | "trip_origin" | "trip_destination" | "trip_last" | "trip_history" | "safety_events" | "driver_info" | "fleet_overview" | "vehicle_stats" | "default",
+  "confidence": float between 0.0 and 1.0
+}}
+
+Rules for query_category and confidence:
+- Only populate query_category when intent is 'text_to_sql'. Use 'default' for all other intents.
+- vehicle_location: user asks for current/last known position of a specific vehicle.
+- vehicle_livetrack: user asks for GPS history, tracking trail, speed history, or currently moving vehicles fleet-wide.
+- trip_current: user asks for details about a vehicle's active (in-progress) trip.
+- trip_origin: user asks where a vehicle came from / started.
+- trip_destination: user asks where a vehicle is going / its destination.
+- trip_last: user asks for the most recent completed trip.
+- trip_history: user asks for multiple trips, trip history, or trip statistics for a SPECIFIC vehicle.
+- safety_events: user asks about speeding, harsh braking, incidents, or events.
+- driver_info: user asks about drivers, users, licenses, or driver assignments.
+- fleet_overview: user asks broad fleet-wide questions (total vehicles, utilization, fleet summary, vehicles by manufacturer, fleet safety score).
+- vehicle_stats: user asks for rankings, comparisons, or aggregates ACROSS ALL vehicles (e.g., 'which vehicle has the highest/most/best/worst X', 'top 5 vehicles by distance', 'vehicle with most trips', 'highest mileage vehicle', 'lowest safety score vehicle'). ALWAYS use vehicle_stats — NOT vehicle_location — for superlative/ranking queries.
+- default: query doesn't clearly fit the above categories.
+- confidence: your certainty about the query_category (1.0 = very certain, 0.0 = unsure)."""
 
         user_prompt = f"Current User Query: {raw_user_prompt}\nJSON Output:"
 
@@ -100,7 +136,7 @@ JSON Schema:
             
             parsed_result = json.loads(cleaned_json)
             
-            # Validate output keys
+            # Validate output keys and apply defaults for new fields
             if "is_supported" not in parsed_result:
                 parsed_result["is_supported"] = True
             if "intent" not in parsed_result:
@@ -109,6 +145,13 @@ JSON Schema:
                 parsed_result["denial_reason"] = None
             if "response_text" not in parsed_result:
                 parsed_result["response_text"] = None
+            if "query_category" not in parsed_result or not parsed_result["query_category"]:
+                parsed_result["query_category"] = "default"
+            # Clamp confidence to [0.0, 1.0]
+            try:
+                parsed_result["confidence"] = max(0.0, min(1.0, float(parsed_result.get("confidence", 1.0))))
+            except (TypeError, ValueError):
+                parsed_result["confidence"] = 1.0
                 
             return parsed_result
             
@@ -118,7 +161,9 @@ JSON Schema:
                 "is_supported": True,
                 "denial_reason": None,
                 "intent": "text_to_sql",
-                "response_text": None
+                "response_text": None,
+                "query_category": "default",
+                "confidence": 0.0  # Force full-hint fallback on parser error
             }
 
     def _get_capabilities_context(self) -> str:

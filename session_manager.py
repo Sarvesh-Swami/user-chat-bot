@@ -59,13 +59,31 @@ Previous conversation:
 
 Current user question: {current_query}
 
-Rewrite the current question to be completely standalone, replacing any references like "it", "that vehicle", "them", etc. with the specific entities mentioned in the conversation history. 
+CRITICAL INSTRUCTIONS - Read Carefully:
 
-Rules:
-- If the user refers to "it" or "that vehicle", use the specific vehicle ID from the conversation
-- If the user says "them" or "those vehicles", be specific about which vehicles
-- Keep the same intent but make it completely self-contained
-- Return ONLY the rewritten standalone question, no explanation
+1. **ONLY bind context when the user uses explicit pronoun references:**
+   - Pronouns: "it", "its", "that", "this", "them", "those", "these"
+   - Examples that SHOULD use context:
+     * "show me its trips" → use vehicle from history
+     * "what about that vehicle" → use vehicle from history
+     * "tell me about them" → use vehicles from history
+
+2. **DO NOT bind context for general queries without pronouns:**
+   - General queries: "the trips", "all trips", "trips from this week", "vehicles", "the longest trip"
+   - Examples that SHOULD NOT use context:
+     * "show me the trips from this week" → return as-is (general query, no pronoun)
+     * "what are all the vehicles" → return as-is (general query, no pronoun)
+     * "longest trip this week" → return as-is (general query, no pronoun)
+
+3. **The difference:**
+   - "show me ITS trips this week" (pronoun "its") → bind to VHC1119 from history
+   - "show me THE trips this week" (article "the", no pronoun) → DO NOT bind to VHC1119
+
+4. **Test before rewriting:**
+   - Does the query contain pronouns like "it", "its", "that", "them", "those"? → USE context
+   - Does the query only have general articles like "the", "a", "all"? → DO NOT USE context
+
+Return ONLY the rewritten standalone question, no explanation.
 
 Standalone question:"""
     

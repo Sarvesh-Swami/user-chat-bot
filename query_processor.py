@@ -5,14 +5,25 @@ import time
 from typing import Dict, Any, List
 
 class QueryProcessor:
-    def __init__(self, db_manager, llm_client, geocoding_service):
+    def __init__(self, db_manager, llm_client, geocoding_service, schema_cache=None):
         self.db_manager = db_manager
         self.llm_client = llm_client
         self.geocoding_service = geocoding_service
+        # Build real column map from schema_cache for the SQL column validator
+        self._column_map = self._build_column_map(schema_cache or {})
 
-    def _convert_dataframe_to_serializable_dict(self, df, enhance_locations=True):
+    def _convert_dataframe_to_serializable_dict(self, df, enhance_locations=True, skip_geocoding=False):
         """Convert DataFrame to JSON-serializable dict with all numpy types converted and optional location enhancement"""
         try:
+            # Deduplicate DataFrame column names if query returned duplicate names (e.g., SELECT v.*, d.*)
+            if not df.columns.is_unique:
+                cols = pd.Series(df.columns)
+                for duplicate in cols[cols.duplicated()].unique():
+                    dup_indices = cols[cols == duplicate].index.values
+                    for i, idx in enumerate(dup_indices[1:], start=2):
+                        cols[idx] = f"{duplicate}_{i}"
+                df.columns = cols
+
             # Convert DataFrame to list of dictionaries
             records = df.to_dict(orient="records")
             
@@ -39,8 +50,8 @@ class QueryProcessor:
                 
                 serializable_records.append(serializable_record)
             
-            # Enhance with location data if requested and appropriate
-            if enhance_locations and self._should_enhance_with_locations(serializable_records):
+            # Enhance with location data if requested and appropriate (skipped for PDF exports)
+            if enhance_locations and not skip_geocoding and self._should_enhance_with_locations(serializable_records):
                 print("[LOCATION ENHANCEMENT] Adding human-readable locations to response")
                 serializable_records = self.geocoding_service.enhance_location_data(serializable_records)
             
@@ -51,7 +62,7 @@ class QueryProcessor:
             # Fallback: use json.dumps with custom serializer
             try:
                 records = json.loads(json.dumps(df.to_dict(orient="records"), default=self.db_manager._json_serializer))
-                if enhance_locations and self._should_enhance_with_locations(records):
+                if enhance_locations and not skip_geocoding and self._should_enhance_with_locations(records):
                     print("[LOCATION ENHANCEMENT] Adding locations to fallback response")
                     records = self.geocoding_service.enhance_location_data(records)
                 return records
@@ -85,183 +96,109 @@ class QueryProcessor:
     def _execute_with_smart_limits(self, sql_query, user_question):
         """Execute SQL with intelligent row count management and auto-summarization on PostgreSQL"""
         
-        # Classify query type to determine appropriate limits
         query_type = self.llm_client._classify_query_type(user_question, sql_query)
-        
-        # Configuration thresholds based on query type
-        if query_type == "general":
-            SMALL_THRESHOLD = 5      # Very small for general queries to avoid timeouts
-            MEDIUM_THRESHOLD = 15    # Still small for general queries
-            print(f"[SMART LIMITS] Detected GENERAL query - using conservative limits")
-        else:
-            SMALL_THRESHOLD = 50     # Normal limits for specific queries
-            MEDIUM_THRESHOLD = 200   
-            print(f"[SMART LIMITS] Detected SPECIFIC query - using standard limits")
+        MAX_CHAT_ROWS = 7
+        PDF_MAX_ROWS  = 200   # Hard cap: max rows for PDF report generation (instant render)
         
         try:
-            # Step 1: Try to get row count first using PostgreSQL syntax
-            count_sql = f"SELECT COUNT(*) as row_count FROM ({sql_query.rstrip(';')}) AS count_subquery"
-            
-            try:
-                count_results = self.db_manager.execute_query(count_sql)
-                total_rows = int(count_results[0][0])
-                print(f"[SMART LIMITS] Query will return {total_rows} rows (Type: {query_type.upper()})")
-            
-            except Exception as count_error:
-                print(f"[SMART LIMITS] Count query failed: {count_error}")
-                print("[SMART LIMITS] Falling back to direct execution")
-                
-                # Fallback: execute original query directly
-                try:
-                    df_result = pd.read_sql_query(sql_query, self.db_manager.conn)
-                    total_rows = len(df_result)
-                    print(f"[SMART LIMITS] Direct execution returned {total_rows} rows")
-                    
-                    # Check for empty results on specific vehicle queries
-                    if total_rows == 0 and self._is_specific_vehicle_query(sql_query):
-                        vehicle_id = self._extract_vehicle_id(sql_query)
-                        if vehicle_id:
-                            print(f"[VEHICLE FALLBACK] No current data for vehicle {vehicle_id}, checking last known data")
-                            last_known = self._get_last_known_data(vehicle_id)
-                            return {
-                                "is_summary": True,
-                                "response": self._generate_vehicle_not_found_response(vehicle_id, last_known),
-                                "total_rows": 0,
-                                "query_type": query_type
-                            }
-                    
-                    # Apply limits after execution if needed
-                    if total_rows <= SMALL_THRESHOLD:
-                        return {
-                            "is_summary": False,
-                            "data": self._convert_dataframe_to_serializable_dict(df_result),
-                            "total_rows": int(total_rows),
-                            "query_type": query_type
-                        }
-                    elif total_rows <= MEDIUM_THRESHOLD:
-                        limited_df = df_result.head(SMALL_THRESHOLD)
-                        return {
-                            "is_summary": False,
-                            "data": self._convert_dataframe_to_serializable_dict(limited_df),
-                            "total_rows": int(total_rows),
-                            "is_limited": True,
-                            "showing": len(limited_df),
-                            "query_type": query_type
-                        }
-                    else:
-                        # Generate summary from the actual data
-                        summary_response = self._generate_summary_from_dataframe(df_result, user_question, total_rows)
-                        return {
-                            "is_summary": True,
-                            "response": summary_response,
-                            "total_rows": total_rows,
-                            "query_type": query_type
-                        }
-                        
-                except Exception as exec_error:
-                    print(f"[SMART LIMITS] Direct execution also failed: {exec_error}")
-                    raise exec_error
-            
-            # Step 2: Decide execution strategy based on row count and query type
-            if total_rows <= SMALL_THRESHOLD:
-                # Small result: return full data
-                df_result = pd.read_sql_query(sql_query, self.db_manager.conn)
-                
-                # Check for empty results on specific vehicle queries
-                if len(df_result) == 0 and self._is_specific_vehicle_query(sql_query):
-                    vehicle_id = self._extract_vehicle_id(sql_query)
-                    if vehicle_id:
-                        print(f"[VEHICLE FALLBACK] No current data for vehicle {vehicle_id}, checking last known data")
-                        last_known = self._get_last_known_data(vehicle_id)
-                        return {
-                            "is_summary": True,
-                            "response": self._generate_vehicle_not_found_response(vehicle_id, last_known),
-                            "total_rows": 0,
-                            "query_type": query_type
-                        }
-                
-                return {
-                    "is_summary": False,
-                    "data": self._convert_dataframe_to_serializable_dict(df_result),
-                    "total_rows": int(total_rows),
-                    "query_type": query_type
-                }
-                
-            elif total_rows <= MEDIUM_THRESHOLD:
-                # Medium result: return limited data with context
-                limited_sql = f"{sql_query.rstrip(';')} LIMIT {SMALL_THRESHOLD};"
-                df_result = pd.read_sql_query(limited_sql, self.db_manager.conn)
-                
-                return {
-                    "is_summary": False,
-                    "data": self._convert_dataframe_to_serializable_dict(df_result),
-                    "total_rows": int(total_rows),
-                    "is_limited": True,
-                    "showing": len(df_result),
-                    "query_type": query_type
-                }
-                
+            # Fast probe query with LIMIT (PDF_MAX_ROWS + 1) without heavy ORDER BY/LIMIT to avoid slow table sorts
+            has_explicit_limit = bool(re.search(r'\bLIMIT\s+\d+', sql_query, re.IGNORECASE))
+
+            if has_explicit_limit:
+                probe_sql = sql_query
+                df_probe = pd.read_sql_query(probe_sql, self.db_manager.conn)
+                fetched_count = len(df_probe)
             else:
-                # Large result: Check if this is a trip summary query that needs LLM synthesis
-                if self._should_synthesize_with_llm(sql_query, user_question):
-                    # For trip summaries, get aggregated stats and pass to LLM for synthesis
-                    trip_stats = self._get_trip_summary_stats(sql_query)
-                    
-                    # Fetch raw records (up to 100) for subsequent charting requests
-                    try:
-                        raw_sql = f"{sql_query.rstrip(';')} LIMIT 100;"
-                        df_raw = pd.read_sql_query(raw_sql, self.db_manager.conn)
-                        raw_records = self._convert_dataframe_to_serializable_dict(df_raw)
-                    except Exception as raw_err:
-                        print(f"[RAW RECORDS FETCH ERROR]: {raw_err}")
-                        raw_records = None
-                        
-                    return {
-                        "is_summary": False,
-                        "data": trip_stats,
-                        "raw_records": raw_records,
-                        "total_rows": int(total_rows),
-                        "query_type": query_type,
-                        "is_trip_summary": True
-                    }
+                # Fast probe query with LIMIT (PDF_MAX_ROWS + 1) without heavy ORDER BY/LIMIT to avoid slow table sorts
+                probe_clean = re.sub(r'\s+ORDER\s+BY\s+.*', '', sql_query, flags=re.IGNORECASE | re.DOTALL)
+                probe_clean = re.sub(r'\s+LIMIT\s+\d+.*', '', probe_clean, flags=re.IGNORECASE | re.DOTALL)
+                probe_sql = f"{probe_clean.rstrip(';')} LIMIT {PDF_MAX_ROWS + 1};"
+                df_probe = pd.read_sql_query(probe_sql, self.db_manager.conn)
+                fetched_count = len(df_probe)
+            
+            print(f"[SMART LIMITS] Fast probe fetched {fetched_count} rows (Query Type: {query_type.upper()})")
+            
+            # Case 1: 0 rows returned -> anti-hallucination / context-aware empty response
+            if fetched_count == 0:
+                return self._handle_empty_result(sql_query, user_question, query_type)
+            
+            # Case 2: 1 to 7 rows -> small result, pass full data to chat LLM synthesis
+            if fetched_count <= MAX_CHAT_ROWS:
+                df_result = pd.read_sql_query(sql_query, self.db_manager.conn)
+                serialized = self._convert_dataframe_to_serializable_dict(df_result)
+                num_cols = len(serialized[0]) if serialized else 0
+
+                # is_detail_preview: triggered when user asks for full/all details on a SINGLE entity.
+                # Condition: SPECIFIC query type, exactly 1 row returned, and ≥8 columns in the result
+                # (indicating a rich JOIN query like SELECT v.*, d.*, o.* that covers all vehicle info).
+                # In this case we show a clean preview card + offer a PDF instead of a markdown text blob.
+                is_detail_preview = (
+                    query_type.lower() == "specific"
+                    and fetched_count == 1
+                    and num_cols >= 8
+                )
+
+                if is_detail_preview:
+                    print(f"[SMART LIMITS] Single-row wide result ({num_cols} cols). Flagging as detail_preview.")
                 else:
-                    # Standard large result: return summary only
-                    summary_response = self.llm_client._generate_summary_response(sql_query, user_question, total_rows)
-                    return {
-                        "is_summary": True,
-                        "response": summary_response,
-                        "total_rows": total_rows,
-                        "query_type": query_type
-                    }
+                    print(f"[SMART LIMITS] Result count {fetched_count} <= {MAX_CHAT_ROWS}. Routing to Chat Synthesis LLM for text response.")
+
+                return {
+                    "is_summary": False,
+                    "is_detail_preview": is_detail_preview,
+                    "data": serialized,
+                    "total_rows": int(len(df_result)),
+                    "num_cols": num_cols,
+                    "query_type": query_type
+                }
+            
+            # Case 3: > 7 rows -> large result, generate PDF report using probe data (skip geocoding & zero DB overhead)
+            print(f"[SMART LIMITS] Result count > {MAX_CHAT_ROWS} threshold. Triggering PDF report generation.")
+            pdf_df = df_probe.head(PDF_MAX_ROWS)
+            full_data = self._convert_dataframe_to_serializable_dict(pdf_df, skip_geocoding=True)
+            
+            total_rows_display = f"{PDF_MAX_ROWS}+" if fetched_count > PDF_MAX_ROWS else len(pdf_df)
+            print(f"[PDF REPORT] Generating PDF with {len(pdf_df)} rows")
+            
+            return {
+                "is_pdf_report": True,
+                "data": full_data,
+                "total_rows": total_rows_display,
+                "query_type": query_type
+            }
                 
         except Exception as e:
             print(f"[SMART LIMITS ERROR]: {e}")
-            # Final fallback to original execution
             try:
-                df_result = pd.read_sql_query(sql_query, self.db_manager.conn)
-                total_rows = len(df_result)
-                
-                # Check for empty results on specific vehicle queries
-                if total_rows == 0 and self._is_specific_vehicle_query(sql_query):
-                    vehicle_id = self._extract_vehicle_id(sql_query)
-                    if vehicle_id:
-                        print(f"[VEHICLE FALLBACK] No current data for vehicle {vehicle_id}, checking last known data")
-                        last_known = self._get_last_known_data(vehicle_id)
-                        return {
-                            "is_summary": True,
-                            "response": self._generate_vehicle_not_found_response(vehicle_id, last_known),
-                            "total_rows": 0,
-                            "query_type": query_type
-                        }
-                
+                if self.db_manager.conn and not self.db_manager.conn.closed:
+                    self.db_manager.conn.rollback()
+            except Exception:
+                pass
+            raise e
+
+    def _handle_empty_result(self, sql_query, user_question, query_type):
+        """Handle 0-row query results: deterministic fallback for specific vehicle IDs, or pass empty dataset to synthesis LLM for context-aware responses."""
+        if self._is_specific_vehicle_query(sql_query):
+            vehicle_id = self._extract_vehicle_id(sql_query)
+            if vehicle_id:
+                print(f"[VEHICLE FALLBACK] No current data for vehicle {vehicle_id}, checking last known data")
+                last_known = self._get_last_known_data(vehicle_id)
                 return {
-                    "is_summary": False,
-                    "data": self._convert_dataframe_to_serializable_dict(df_result),
-                    "query_type": query_type
+                    "is_summary": True,
+                    "response": self._generate_vehicle_not_found_response(vehicle_id, last_known),
+                    "total_rows": 0,
+                    "query_type": query_type,
+                    "is_empty": True
                 }
-            except Exception as final_error:
-                print(f"[FINAL FALLBACK ERROR]: {final_error}")
-                raise final_error
+
+        print(f"[EMPTY RESULT] 0 rows returned. Passing empty dataset to synthesis LLM for context-aware response.")
+        return {
+            "is_summary": False,
+            "data": [],
+            "total_rows": 0,
+            "query_type": query_type,
+            "is_empty": True
+        }
 
     def _generate_summary_from_dataframe(self, df, user_question, total_rows):
         """Generate summary from an actual dataframe when count query fails"""
@@ -431,10 +368,20 @@ class QueryProcessor:
     def _fix_postgresql_query_issues(self, sql_query):
         """Optimize queries for PostgreSQL and handle database-specific syntax"""
         
-        sql_upper = sql_query.upper()
+        # Check for inefficient "currently moving" query patterns and warn
+        sql_lower = sql_query.lower()
+        if ('livetrack' in sql_lower and 
+            ('now()' in sql_lower or 'current_timestamp' in sql_lower or 'interval' in sql_lower) and
+            ('speed' in sql_lower or 'moving' in sql_lower)):
+            print("[POSTGRESQL WARNING] Detected potentially inefficient 'currently moving' query using livetrack with time filters.")
+            print("[POSTGRESQL WARNING] For better performance, use: devices.last_speed > 0 instead of livetrack + NOW() - INTERVAL filters.")
         
-        # PostgreSQL has excellent window function support, so most LAG issues are resolved
-        print("[POSTGRESQL] Processing query for PostgreSQL optimization")
+        # Optimize heavy livetrack/allevents joins by adding top-N limit so PostgreSQL uses instant Top-N Heapsort
+        if ('livetrack' in sql_query.lower() or 'allevents' in sql_query.lower()) and 'limit' not in sql_query.lower():
+            print("[POSTGRESQL] Appending top-N LIMIT to prevent full 300k row sorting")
+            sql_query = f"{sql_query.rstrip(';')} LIMIT 200;"
+
+        sql_upper = sql_query.upper()
         
         # Handle spatial distance calculations
         if 'CALCULATE_DISTANCE' in sql_upper:
@@ -548,34 +495,181 @@ class QueryProcessor:
         
         return sql_query
 
+    # ---------------------------------------------------------------------------
+    # Option 2 — SQL Column Validator & Auto-Corrector
+    # ---------------------------------------------------------------------------
+
+    def _build_column_map(self, schema_cache: dict) -> dict:
+        """
+        Build a lookup dict {table_name: set(column_names)} from schema_cache.
+        Called once at startup; used by _validate_and_correct_columns on every query.
+        """
+        column_map = {}
+        tables = schema_cache.get("tables", {})
+        for table_name, table_info in tables.items():
+            cols = {c["name"].lower() for c in table_info.get("columns", [])}
+            column_map[table_name.lower()] = cols
+        if column_map:
+            print(f"[COLUMN VALIDATOR] Built column map for {len(column_map)} tables: {', '.join(sorted(column_map.keys()))}")
+        return column_map
+
+    # Known LLM column name mistakes → correct DB column names.
+    # Format: {table_name: {wrong_name: correct_name}}
+    # None as correct_name means the column doesn't exist at all (flag but don't replace).
+    _KNOWN_CORRECTIONS = {
+        "vehicles": {
+            "total_distance":          "total_distance_in_mile",
+            "total_distance_miles":    "total_distance_in_mile",
+            "mileage":                 "total_distance_in_mile",
+            "odometer":                "total_distance_in_mile",
+            "safety_score":            "score",
+            "driver_score":            "score",
+            "trip_count":              None,   # computed, not stored
+            "trips_count":             None,
+            "num_trips":               None,
+        },
+        "trips": {
+            "distance":                "trip_distance_miles",
+            "miles":                   "trip_distance_miles",
+            "duration":                "trip_duration_seconds",
+            "status":                  "trip_status",
+        },
+        "livetrack": {
+            "timestamp":               "ts_in_str",
+            "ts":                      "ts_in_str",
+            "lat":                     "latitude",
+            "lng":                     "longitude",
+            "long":                    "longitude",
+        },
+        "allevents": {
+            "timestamp":               "ts_in_str",
+            "ts":                      "ts_in_str",
+            "lat":                     "latitude",
+            "lng":                     "longitude",
+            "long":                    "longitude",
+            "event":                   "event_type",
+        },
+        "devices": {
+            "lat":                     "last_ping_lat",
+            "lng":                     "last_ping_lng",
+            "long":                    "last_ping_lng",
+            "speed":                   "last_speed",
+            "ping_time":               "last_ping_ms",
+        },
+    }
+
+    def _validate_and_correct_columns(self, sql: str) -> str:
+        """
+        Option 2 — Post-generation SQL column validator.
+
+        Steps:
+          1. Parse FROM / JOIN clauses to build alias → table_name mapping.
+          2. Scan all alias.column references in the SQL.
+          3. Apply KNOWN_CORRECTIONS for common LLM column name mistakes.
+          4. Check remaining references against the real schema_cache column map.
+          5. Log every correction and any still-unknown references (soft warning only).
+
+        Returns the corrected SQL string. Never raises — on any error it returns
+        the original SQL unchanged so the pipeline is not disrupted.
+        """
+        try:
+            corrections_made = []
+
+            # ── Step 1: build alias→table map from FROM / JOIN clauses ──────────
+            # Matches patterns like: FROM vehicles v, JOIN trips t ON ...
+            alias_map = {}   # {alias_lower: table_name_lower}
+            # Match "table_name alias" or "table_name AS alias" patterns
+            from_join_pattern = re.compile(
+                r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)',
+                re.IGNORECASE
+            )
+            for match in from_join_pattern.finditer(sql):
+                table_name = match.group(1).lower()
+                alias      = match.group(2).lower()
+                # Skip SQL keywords that might be accidentally captured
+                sql_keywords = {"on", "where", "and", "or", "inner", "left", "right",
+                                "outer", "cross", "natural", "using", "set", "as"}
+                if alias not in sql_keywords:
+                    alias_map[alias] = table_name
+                    # Also register table name itself as its own alias
+                if table_name not in sql_keywords:
+                    alias_map[table_name] = table_name
+
+            # ── Step 2: find all alias.column references ─────────────────────
+            col_ref_pattern = re.compile(
+                r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
+            )
+
+            corrected_sql = sql
+
+            for match in col_ref_pattern.finditer(sql):
+                alias  = match.group(1).lower()
+                column = match.group(2).lower()
+                ref    = match.group(0)          # original text e.g. "v.total_distance"
+
+                # Resolve alias to table name
+                table = alias_map.get(alias)
+                if not table:
+                    continue   # alias unknown — skip (could be a subquery alias, CTE, etc.)
+
+                # ── Step 3: apply KNOWN_CORRECTIONS first ─────────────────────
+                table_corrections = self._KNOWN_CORRECTIONS.get(table, {})
+                if column in table_corrections:
+                    correct_col = table_corrections[column]
+                    if correct_col is None:
+                        # Column doesn't exist as a stored field — warn only
+                        print(f"[COLUMN VALIDATOR] [WARN] '{ref}' — '{column}' is not a stored column on '{table}'. May need a subquery.")
+                    else:
+                        new_ref = f"{match.group(1)}.{correct_col}"
+                        if new_ref != ref:
+                            corrected_sql = re.sub(rf'\b{re.escape(ref)}\b', new_ref, corrected_sql)
+                            corrections_made.append(f"{ref} -> {new_ref}")
+                    continue
+
+                # ── Step 4: check against real schema_cache column map ─────────
+                if self._column_map and table in self._column_map:
+                    if column not in self._column_map[table]:
+                        print(f"[COLUMN VALIDATOR] [WARN] Unknown column '{ref}' (table='{table}' has no column '{column}')")
+                # (Soft warning only — do not modify the SQL for unknown cols;
+                #  the DB will return an error which triggers self-healing retry.)
+
+            if corrections_made:
+                print(f"[COLUMN VALIDATOR] [OK] Auto-corrected {len(corrections_made)} column reference(s): {', '.join(corrections_made)}")
+            else:
+                print(f"[COLUMN VALIDATOR] [OK] All column references look valid.")
+
+            return corrected_sql
+
+        except Exception as e:
+            # Never break the pipeline — return original SQL on any error
+            print(f"[COLUMN VALIDATOR] Warning: validation failed ({e}), using original SQL.")
+            return sql
+
     def _is_specific_vehicle_query(self, sql_query):
-        """Check if query is looking for a specific vehicle ID"""
-        return bool(re.search(r'\bvid\s*=\s*\d+', sql_query, re.IGNORECASE))
+        """Check if query is looking for a specific vehicle ID or license plate (exact = match only, not ILIKE org searches)"""
+        # Only match v.vehicle_id = '...' or v.license_plate_number = '...' with exact equality
+        # Exclude ILIKE patterns (used for org name searches)
+        return bool(re.search(r'\bv\.(vehicle_id|license_plate_number)\s*=\s*\'([^\']+)\'', sql_query, re.IGNORECASE))
 
     def _extract_vehicle_id(self, sql_query):
-        """Extract vehicle ID from SQL query"""
-        match = re.search(r'\bvid\s*=\s*(\d+)', sql_query, re.IGNORECASE)
-        return match.group(1) if match else None
+        """Extract vehicle ID or license plate from SQL query"""
+        match = re.search(r'\bv\.(vehicle_id|license_plate_number)\s*=\s*\'([^\']+)\'', sql_query, re.IGNORECASE)
+        return match.group(2) if match else None
 
     def _get_last_known_data(self, vehicle_id):
         """Get the most recent data for a specific vehicle from PostgreSQL"""
         try:
             
-            # Try different possible column names and table structures
+            # Target actual PostgreSQL tables: trips, devices, vehicles
             fallback_queries = [
                 f"""
-                SELECT COALESCE(vehicle_id, vid) as vehicle_id, speed, status as mode, 
-                       date, recorded_at as gpstime, address as addr, driver_name as drivername
-                FROM fleet_history 
-                WHERE COALESCE(vehicle_id, vid) = {vehicle_id} 
-                ORDER BY recorded_at DESC, date DESC 
-                LIMIT 1
-                """,
-                f"""
-                SELECT vid as vehicle_id, speed, mode, date, gpstime, addr, drivername
-                FROM fleet_history 
-                WHERE vid = {vehicle_id} 
-                ORDER BY date DESC, gpstime DESC 
+                SELECT v.vehicle_id, d.last_speed as speed, 'active' as mode, 
+                       t.start_date as date, d.last_ping_ms as gpstime, t.start_address as addr, null as drivername
+                FROM vehicles v
+                LEFT JOIN devices d ON v.device_id = d.id
+                LEFT JOIN trips t ON v.id = t.vehicle_id
+                WHERE v.vehicle_id = '{vehicle_id}' OR v.license_plate_number = '{vehicle_id}'
+                ORDER BY t.start_date DESC
                 LIMIT 1
                 """
             ]
@@ -615,11 +709,14 @@ class QueryProcessor:
             if len(str(last_known_data.get('addr', ''))) > 50:
                 location += "..."
             
+            disp_msg = f"No current location data available for vehicle **{vehicle_id}** today. Last recorded activity was on {last_known_data.get('date', 'Unknown date')} near {location}."
             return json.dumps({
+                "type": "text",
                 "status": "no_current_data",
+                "display_value": disp_msg,
                 "query_type": "vehicle_status",
-                "vehicle_id": int(vehicle_id),
-                "message": f"No data available for vehicle {vehicle_id} on 2026-06-20 (today)",
+                "vehicle_id": str(vehicle_id),
+                "message": disp_msg,
                 "last_known": {
                     "date": str(last_known_data.get('date', 'Unknown')),
                     "time": str(last_known_data.get('gpstime', 'Unknown')),
@@ -631,22 +728,22 @@ class QueryProcessor:
                 "suggestions": [
                     f"Check recent history: 'vehicle {vehicle_id} yesterday'",
                     f"View last week data: 'vehicle {vehicle_id} last week'",
-                    f"Get route history: 'vehicle {vehicle_id} route history'",
-                    "Contact fleet manager if vehicle should be active"
+                    f"Get route history: 'vehicle {vehicle_id} route history'"
                 ],
                 "note": f"Last seen on {last_known_data.get('date', 'unknown date')} at {location}"
             }, default=self.db_manager._json_serializer)
         else:
+            disp_msg = f"Vehicle **{vehicle_id}** was not found in the fleet database. Please verify the vehicle ID or license plate number."
             return json.dumps({
+                "type": "text",
                 "status": "vehicle_not_found",
+                "display_value": disp_msg,
                 "query_type": "vehicle_status", 
-                "vehicle_id": int(vehicle_id),
-                "message": f"Vehicle {vehicle_id} not found in the fleet database",
+                "vehicle_id": str(vehicle_id),
+                "message": disp_msg,
                 "suggestions": [
-                    "Verify the vehicle ID is correct",
-                    "Check if vehicle is registered in system",
-                    "Contact fleet administrator",
-                    "Try: 'show all vehicles' to see available fleet"
+                    "Verify the vehicle ID or license plate is correct",
+                    "Try searching for driver name or organization"
                 ],
                 "note": "This vehicle ID does not exist in our records"
             }, default=self.db_manager._json_serializer)

@@ -88,10 +88,14 @@ class DatabaseManager:
                     
             except Exception as e:
                 print(f"[DATABASE] Query attempt {attempt + 1} failed: {e}")
+                try:
+                    if self.conn and not self.conn.closed:
+                        self.conn.rollback()
+                except Exception:
+                    pass
                 if attempt == max_retries:
                     raise e
                 else:
-                    # Try to reconnect for next attempt
                     try:
                         self._init_database_connection()
                     except Exception:

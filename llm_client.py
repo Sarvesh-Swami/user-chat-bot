@@ -112,12 +112,12 @@ Examples: "show running vehicles", "list idle vehicles", "vehicles that are stop
 
 SPECIFIC queries ask for:
 - Particular vehicles by ID, name, or identifier
+- Superlatives, rankings, or limits (highest distance, lowest battery, top 5, fastest, most trips)
 - Specific drivers by name
 - Vehicles at specific locations or geofences
 - Historical tracking of specific assets
 - Detailed information about identified entities
-Examples: "show vehicle ABC123", "find driver John Smith", "vehicles at Delhi depot", "track vehicle 12345"
-
+Examples: "show vehicle ABC123", "which vehicle has highest travel distance", "find driver John Smith", "top 5 vehicles"
 User Query: "{query}"
 
 Respond with exactly one word: GENERAL or SPECIFIC"""
@@ -621,5 +621,14 @@ Respond with exactly one word: GENERAL or SPECIFIC"""
         schema_parts.append("- ST_Distance(point1, point2): Calculate distance between two geographic points")
         schema_parts.append("- ST_DWithin(geometry, geometry, distance): Check if geometries are within specified distance")
         schema_parts.append("- For lat/lng calculations, use: ST_Distance(ST_Point(lng1, lat1), ST_Point(lng2, lat2))")
+        
+        # Add known enum/categorical column values
+        enum_values = self.schema_cache.get('enum_values', {})
+        if enum_values:
+            schema_parts.append("\n### KNOWN COLUMN VALUES (use these EXACT values in WHERE clauses — do NOT invent your own):")
+            for col_key, values in enum_values.items():
+                values_str = ", ".join(f"'{v}'" for v in values)
+                schema_parts.append(f"  - {col_key}: [{values_str}]")
+            schema_parts.append("IMPORTANT: When filtering on any of the columns above, you MUST use one of the listed values exactly as shown. Do NOT guess or translate user words into snake_case or other formats.")
         
         return "\n".join(schema_parts)

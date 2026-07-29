@@ -22,14 +22,18 @@ class SchemaLoader:
             # Get relationships between core tables only
             relationships = self._get_relationships()
             
-            # Skip date context loading for faster startup - use default
-            print("[SCHEMA] Using default date context for faster startup...")
-            self.mock_today = '2026-06-20'
+            # Get distinct values for enum-like columns
+            enum_values = self._get_enum_column_values()
+            
+            # Get actual date context from the database
+            print("[SCHEMA] Getting current date context from database...")
+            self.mock_today = self._get_current_date_context()
             
             # Cache the schema information
             self.schema_cache = {
                 'tables': tables_info,
                 'relationships': relationships,
+                'enum_values': enum_values,
                 'last_updated': self.mock_today,
                 'schema_type': 'focused_6_tables'
             }
@@ -44,11 +48,12 @@ class SchemaLoader:
             # Set minimal default schema to prevent crashes
             self.schema_cache = {
                 'tables': {}, 
-                'relationships': [], 
+                'relationships': [],
+                'enum_values': {},
                 'last_updated': '2026-06-20',
                 'schema_type': 'fallback'
             }
-            self.mock_today = '2026-06-20'
+            self.mock_today = self._get_current_date_context()
 
 
     def _get_tables_info(self):
@@ -160,42 +165,68 @@ class SchemaLoader:
         return relationships
 
     def _get_current_date_context(self):
-        """Get the current date context from the actual data in core tables"""
+        """Get the current date context using actual system date (not database date)"""
         try:
-            print("[SCHEMA] Getting current date context from data...")
-            # Use faster, more targeted queries with limits
-            date_queries = [
-                "SELECT ts_in_str as max_date FROM livetrack WHERE ts_in_str IS NOT NULL ORDER BY ts_in_str DESC LIMIT 1",
-                "SELECT start_date as max_date FROM trips WHERE start_date IS NOT NULL ORDER BY start_date DESC LIMIT 1",
-                "SELECT ts_in_str as max_date FROM allevents WHERE ts_in_str IS NOT NULL ORDER BY ts_in_str DESC LIMIT 1", 
-                "SELECT CURRENT_DATE as max_date"  # Fallback to current date
-            ]
+            from datetime import datetime
             
-            for i, query in enumerate(date_queries):
-                try:
-                    print(f"[SCHEMA] Trying date query {i+1}/{len(date_queries)}...")
-                    # Execute query with timeout via DatabaseManager
-                    results = self.db_manager.execute_query(query)
-                    
-                    if results and results[0] and results[0][0]:
-                        date_value = results[0][0]
+            print("[SCHEMA] Getting current date context from system...")
+            
+            # Use the actual system date (real current date)
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            
+            print(f"[SCHEMA] Using actual system date: {current_date}")
+            
+            # Also query database to show what data range is available (informational only)
+            try:
+                date_queries = [
+                    "SELECT MAX(end_date) as max_date FROM trips WHERE end_date IS NOT NULL LIMIT 1",
+                    "SELECT MIN(start_date) as min_date FROM trips WHERE start_date IS NOT NULL LIMIT 1"
+                ]
+                
+                max_db_date = None
+                min_db_date = None
+                
+                results = self.db_manager.execute_query(date_queries[0])
+                if results and len(results) > 0:
+                    row = results[0]
+                    date_value = row['max_date'] if isinstance(row, dict) else row[0]
+                    if date_value:
                         if isinstance(date_value, str):
-                            final_date = date_value[:10]  # Extract date part if timestamp
+                            max_db_date = date_value[:10]
                         else:
-                            final_date = date_value.strftime('%Y-%m-%d')
-                        print(f"[SCHEMA] Date context found: {final_date}")
-                        return final_date
-                except Exception as e:
-                    print(f"[SCHEMA] Date query {i+1} failed: {e}")
-                    continue
+                            max_db_date = date_value.strftime('%Y-%m-%d')
+                
+                results = self.db_manager.execute_query(date_queries[1])
+                if results and len(results) > 0:
+                    row = results[0]
+                    date_value = row['min_date'] if isinstance(row, dict) else row[0]
+                    if date_value:
+                        if isinstance(date_value, str):
+                            min_db_date = date_value[:10]
+                        else:
+                            min_db_date = date_value.strftime('%Y-%m-%d')
+                
+                if min_db_date and max_db_date:
+                    print(f"[SCHEMA] Database data range: {min_db_date} to {max_db_date}")
+                    
+                    # Calculate age of data
+                    from datetime import datetime
+                    max_date_obj = datetime.strptime(max_db_date, '%Y-%m-%d')
+                    current_date_obj = datetime.strptime(current_date, '%Y-%m-%d')
+                    days_old = (current_date_obj - max_date_obj).days
+                    
+                    if days_old > 0:
+                        print(f"[SCHEMA] Note: Database data is {days_old} days old (latest: {max_db_date}, current: {current_date})")
+                    
+            except Exception as info_error:
+                print(f"[SCHEMA] Could not determine database date range (non-critical): {info_error}")
             
-            # Final fallback
-            print("[SCHEMA] Using fallback date: 2026-06-20")
-            return '2026-06-20'
+            return current_date
             
         except Exception as e:
-            print(f"[SCHEMA] Could not determine date context: {e}")
-            return '2026-06-20'
+            print(f"[SCHEMA] Could not get system date: {e}")
+            # Fallback to a reasonable default
+            return '2026-07-29'
     
     def _get_table_description(self, table_name):
         """Generate business-friendly description for core 6 tables only"""
@@ -275,12 +306,12 @@ class SchemaLoader:
                 'speed': 'Vehicle speed at time of recording',
                 'heading': 'Direction vehicle was traveling (degrees)',
                 'ts_in_str': 'Timestamp when this data was recorded',
-                'event_type': 'Type of tracking event (movement, stop, etc.)',
+                'event_type': 'Type of tracking event — use EXACT values from KNOWN COLUMN VALUES section',
                 'speed_limit_mph': 'Posted speed limit at this location'
             },
             'allevents': {
                 'imei': 'Device IMEI that detected this event',
-                'event_type': 'Type of safety/operational event (speeding, harsh_braking, etc.)',
+                'event_type': 'Type of safety/operational event — use EXACT values from KNOWN COLUMN VALUES section',
                 'latitude': 'GPS latitude where event occurred',
                 'longitude': 'GPS longitude where event occurred',
                 'speed': 'Vehicle speed when event occurred',
@@ -323,7 +354,36 @@ class SchemaLoader:
             return "Performance or safety score (0-100 scale)"
         else:
             return f"Field: {column_name}"
-    
+
+    def _get_enum_column_values(self):
+        """Query distinct values for enum-like columns so the LLM uses real values, not guesses."""
+        
+        # Define which table.column pairs have a small, finite set of categorical values
+        enum_columns = {
+            'allevents': ['event_type'],
+            'livetrack': ['event_type'],
+            'trips':     ['trip_status'],
+            'vehicles':  ['status'],
+            'devices':   ['status'],
+        }
+        
+        enum_values = {}
+        
+        for table, columns in enum_columns.items():
+            for col in columns:
+                try:
+                    query = f"SELECT DISTINCT {col} FROM public.{table} WHERE {col} IS NOT NULL ORDER BY {col} LIMIT 50;"
+                    results = self.db_manager.execute_query(query)
+                    values = [row[col] if isinstance(row, dict) else row[0] for row in results if row]
+                    if values:
+                        key = f"{table}.{col}"
+                        enum_values[key] = values
+                        print(f"[SCHEMA] Enum values for {key}: {values}")
+                except Exception as e:
+                    print(f"[SCHEMA] Could not load enum values for {table}.{col}: {e}")
+        
+        return enum_values
+
     def load_schema(self):
         """Load and return schema cache and date context"""
         self._load_database_schema()

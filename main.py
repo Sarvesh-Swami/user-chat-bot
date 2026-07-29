@@ -168,6 +168,45 @@ def chat_interface():
                 font-style: italic;
             }
             
+            .typing-indicator-content {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 14px 18px;
+                min-height: 42px;
+            }
+            
+            .typing-dot {
+                width: 8px;
+                height: 8px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 50%;
+                animation: typingPulse 1.4s infinite ease-in-out;
+            }
+            
+            .typing-dot:nth-child(1) {
+                animation-delay: 0s;
+            }
+            
+            .typing-dot:nth-child(2) {
+                animation-delay: 0.2s;
+            }
+            
+            .typing-dot:nth-child(3) {
+                animation-delay: 0.4s;
+            }
+            
+            @keyframes typingPulse {
+                0%, 60%, 100% {
+                    transform: translateY(0);
+                    opacity: 0.4;
+                }
+                30% {
+                    transform: translateY(-6px);
+                    opacity: 1;
+                }
+            }
+            
             .temperature-control {
                 display: flex;
                 align-items: center;
@@ -251,10 +290,6 @@ def chat_interface():
                         Send
                     </button>
                 </form>
-                
-                <div class="loading" id="loading">
-                    🤔 Thinking...
-                </div>
             </div>
         </div>
 
@@ -262,7 +297,6 @@ def chat_interface():
             const chatMessages = document.getElementById('chatMessages');
             const messageInput = document.getElementById('messageInput');
             const sendButton = document.getElementById('sendButton');
-            const loading = document.getElementById('loading');
             const temperatureSlider = document.getElementById('temperature');
             const tempValue = document.getElementById('tempValue');
 
@@ -317,12 +351,19 @@ def chat_interface():
                         let emailMode = '';
                         let emailFilename = '';
                         
+                        let isDetailPreview = false;
+                        let detailPreviewData = null;
+                        
                         // Check if the response payload contains a PDF report
                         if (data.response && data.response.type === 'pdf_report') {
                             isPdfReport = true;
                             botResponse = data.response.display_value || 'PDF report ready.';
                             pdfUrl   = data.response.url || '';
                             pdfLabel = data.response.filename || 'report.pdf';
+                        // Check if the response is a detail preview (wide-record "all details" queries)
+                        } else if (data.response && data.response.type === 'detail_preview') {
+                            isDetailPreview = true;
+                            detailPreviewData = data.response;
                         // Check if the response payload contains an email sent confirmation
                         } else if (data.response && data.response.type === 'email_sent') {
                             isEmailSent = true;
@@ -343,12 +384,14 @@ def chat_interface():
                         }
                         
                         // Add processing metadata timing parameters
-                        if (data.execution_time_ms) {
+                        if (data.execution_time_ms && !isDetailPreview) {
                             botResponse += `\n\n⏱️ ${data.execution_time_ms.toFixed(0)}ms`;
                         }
                         
                         // Send indicators to the rendering pipeline
-                        if (isPdfReport) {
+                        if (isDetailPreview) {
+                            addDetailPreviewCard(detailPreviewData, data.execution_time_ms);
+                        } else if (isPdfReport) {
                             addPdfCard(botResponse, pdfUrl, pdfLabel);
                         } else if (isEmailSent) {
                             addEmailCard(botResponse, emailRecipient, emailSubject, emailMode, emailFilename);
@@ -407,6 +450,158 @@ def chat_interface():
                 chatMessages.appendChild(messageDiv);
                 
                 // Keep the chat frame scrolled down
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            function addDetailPreviewCard(previewData, execTimeMs) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message bot';
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+                contentDiv.style.cssText = 'max-width: 520px;';
+
+                // ── Header label ──
+                const entityName = previewData.entity_name || 'Record';
+                const totalCols  = previewData.total_cols  || 0;
+
+                const headerDiv = document.createElement('div');
+                headerDiv.style.cssText = 'margin-bottom: 10px; font-size: 13px; color: #475569;';
+                headerDiv.innerHTML = `Here's a <strong>summary</strong> for <strong style="color:#6366f1;">${entityName}</strong> (${totalCols} fields in total):`;
+                contentDiv.appendChild(headerDiv);
+
+                // ── Preview table card ──
+                const tableCard = document.createElement('div');
+                tableCard.style.cssText = `
+                    background: linear-gradient(135deg, #f8f9ff 0%, #ede9fe 100%);
+                    border: 1px solid #c4b5fd;
+                    border-radius: 12px;
+                    overflow: hidden;
+                    margin-bottom: 12px;
+                    box-shadow: 0 2px 8px rgba(99,102,241,0.08);
+                `;
+
+                const table = document.createElement('table');
+                table.style.cssText = 'width: 100%; border-collapse: collapse; font-size: 13px;';
+
+                const rows = previewData.preview_table || [];
+                rows.forEach((row, idx) => {
+                    const tr = document.createElement('tr');
+                    tr.style.cssText = idx % 2 === 0
+                        ? 'background: rgba(255,255,255,0.55);'
+                        : 'background: rgba(237,233,254,0.45);';
+
+                    const tdLabel = document.createElement('td');
+                    tdLabel.style.cssText = `
+                        padding: 8px 14px;
+                        font-weight: 600;
+                        color: #4c1d95;
+                        width: 42%;
+                        border-bottom: 1px solid rgba(196,181,253,0.3);
+                        white-space: nowrap;
+                    `;
+                    tdLabel.textContent = row.label;
+
+                    const tdValue = document.createElement('td');
+                    tdValue.style.cssText = `
+                        padding: 8px 14px;
+                        color: #1e293b;
+                        border-bottom: 1px solid rgba(196,181,253,0.3);
+                        word-break: break-word;
+                    `;
+                    tdValue.textContent = row.value;
+
+                    tr.appendChild(tdLabel);
+                    tr.appendChild(tdValue);
+                    table.appendChild(tr);
+                });
+
+                tableCard.appendChild(table);
+                contentDiv.appendChild(tableCard);
+
+                // ── PDF prompt bar ──
+                const promptBar = document.createElement('div');
+                promptBar.style.cssText = `
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    background: #f1f5f9;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 10px;
+                    padding: 10px 14px;
+                `;
+
+                const promptText = document.createElement('span');
+                promptText.style.cssText = 'flex: 1; font-size: 13px; color: #475569;';
+                promptText.textContent = '📄 Would you like a full PDF report with all details?';
+                promptBar.appendChild(promptText);
+
+                // Yes button
+                const yesBtn = document.createElement('button');
+                yesBtn.textContent = 'Yes, Generate PDF';
+                yesBtn.style.cssText = `
+                    padding: 7px 14px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 12px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    white-space: nowrap;
+                    transition: opacity 0.2s;
+                `;
+                yesBtn.onmouseover = () => yesBtn.style.opacity = '0.85';
+                yesBtn.onmouseout  = () => yesBtn.style.opacity = '1';
+                yesBtn.onclick = () => {
+                    // Auto-submit "Yes, generate PDF" into the chat
+                    const input = document.getElementById('messageInput');
+                    if (input) {
+                        input.value = 'Yes, generate PDF';
+                        document.getElementById('chatForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                    }
+                    // Disable buttons after click to avoid double submit
+                    yesBtn.disabled = true;
+                    noBtn.disabled  = true;
+                    yesBtn.style.opacity = '0.5';
+                    noBtn.style.opacity  = '0.5';
+                };
+                promptBar.appendChild(yesBtn);
+
+                // No button
+                const noBtn = document.createElement('button');
+                noBtn.textContent = 'No thanks';
+                noBtn.style.cssText = `
+                    padding: 7px 12px;
+                    background: transparent;
+                    color: #64748b;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 8px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    white-space: nowrap;
+                    transition: background 0.2s;
+                `;
+                noBtn.onmouseover = () => noBtn.style.background = '#f1f5f9';
+                noBtn.onmouseout  = () => noBtn.style.background  = 'transparent';
+                noBtn.onclick = () => {
+                    promptBar.style.display = 'none';
+                };
+                promptBar.appendChild(noBtn);
+
+                contentDiv.appendChild(promptBar);
+
+                // ── Timing badge ──
+                if (execTimeMs) {
+                    const timingDiv = document.createElement('div');
+                    timingDiv.style.cssText = 'font-size: 11px; color: #94a3b8; margin-top: 6px; text-align: right;';
+                    timingDiv.textContent = `⏱️ ${execTimeMs.toFixed(0)}ms`;
+                    contentDiv.appendChild(timingDiv);
+                }
+
+                messageDiv.appendChild(contentDiv);
+                chatMessages.appendChild(messageDiv);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
             }
 
@@ -569,14 +764,35 @@ def chat_interface():
             }
 
             function setLoading(isLoading) {
+                let typingIndicator = document.getElementById('typingIndicator');
                 if (isLoading) {
-                    loading.style.display = 'block';
                     sendButton.disabled = true;
                     messageInput.disabled = true;
+                    
+                    if (!typingIndicator) {
+                        typingIndicator = document.createElement('div');
+                        typingIndicator.className = 'message bot';
+                        typingIndicator.id = 'typingIndicator';
+                        
+                        const contentDiv = document.createElement('div');
+                        contentDiv.className = 'message-content typing-indicator-content';
+                        
+                        for (let i = 0; i < 3; i++) {
+                            const dot = document.createElement('div');
+                            dot.className = 'typing-dot';
+                            contentDiv.appendChild(dot);
+                        }
+                        
+                        typingIndicator.appendChild(contentDiv);
+                        chatMessages.appendChild(typingIndicator);
+                        chatMessages.scrollTop = chatMessages.scrollHeight;
+                    }
                 } else {
-                    loading.style.display = 'none';
                     sendButton.disabled = false;
                     messageInput.disabled = false;
+                    if (typingIndicator) {
+                        typingIndicator.remove();
+                    }
                 }
             }
 

@@ -305,11 +305,10 @@ class PdfReportService:
                     val = row.get(col, "")
                     if val is None:
                         val = ""
-                    # Truncate long strings
                     text = str(val)
-                    if len(text) > 40:
-                        text = text[:37] + "…"
-                    cells.append(Paragraph(text, styles["td"]))
+                    if len(text) > 30:
+                        text = text[:27] + "…"
+                    cells.append(text)
                 table_rows.append(cells)
 
             tbl = Table(table_rows, colWidths=col_widths, repeatRows=1)
@@ -323,7 +322,9 @@ class PdfReportService:
                 ("BOTTOMPADDING",(0, 0), (-1, 0),  6),
                 ("TOPPADDING",   (0, 0), (-1, 0),  6),
                 ("GRID",         (0, 0), (-1, -1), 0.4, BORDER_COLOR),
+                ("FONTNAME",     (0, 1), (-1, -1), "Helvetica"),
                 ("FONTSIZE",     (0, 1), (-1, -1), 7),
+                ("TEXTCOLOR",    (0, 1), (-1, -1), ACCENT),
                 ("TOPPADDING",   (0, 1), (-1, -1), 4),
                 ("BOTTOMPADDING",(0, 1), (-1, -1), 4),
                 ("LEFTPADDING",  (0, 0), (-1, -1), 5),
@@ -335,7 +336,7 @@ class PdfReportService:
                 style_cmds.append(("BACKGROUND", (0, row_idx), (-1, row_idx), bg))
 
             tbl.setStyle(TableStyle(style_cmds))
-            elements.append(KeepTogether([tbl]))
+            elements.append(tbl)
             if chunk_start + CHUNK < len(data):
                 elements.append(Spacer(1, 0.3 * cm))
 
