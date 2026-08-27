@@ -8,6 +8,23 @@ from query_history import QueryHistoryManager, QueryLog
 import time
 from typing import List
 
+# Ensure local database is running before starting the app
+from start_db import ensure_db_running
+
+print("\n" + "="*70)
+print("   FLEET MANAGEMENT CHATBOT - STARTING")
+print("="*70)
+
+# Auto-start the local PostgreSQL database
+if not ensure_db_running():
+    print("\n[STARTUP ERROR] Failed to start local database!")
+    print("[STARTUP] Please run: python setup_local_db.py (one-time setup)")
+    import sys
+    sys.exit(1)
+
+print("[STARTUP] ✓ Database ready")
+print("="*70 + "\n")
+
 # Initialize the FastAPI app
 app = FastAPI(title="Fleet Management Chatbot API", version="1.0.0")
 
